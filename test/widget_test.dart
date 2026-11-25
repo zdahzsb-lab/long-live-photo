@@ -1,12 +1,12 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:long_live_photo/main.dart';
 import 'package:long_live_photo/models/conversion_options.dart';
 import 'package:long_live_photo/services/live_photo_channel.dart';
 import 'package:long_live_photo/utils/motion_photo_spec.dart';
+import 'package:material_ui/material_ui.dart';
 
 class _FakeGateway implements LivePhotoConverterGateway {
   @override
@@ -109,9 +109,13 @@ void main() {
     expect(find.text('1080p 高清均衡（推荐）'), findsOneWidget);
     expect(find.text('720p 省空间（超长视频专用）'), findsOneWidget);
 
-    final saveBtn = tester.widget<FilledButton>(
-      find.byKey(const Key('convert_save_button')),
+    final saveBtnFinder = find.byKey(const Key('convert_save_button'));
+    await tester.scrollUntilVisible(
+      saveBtnFinder,
+      200,
+      scrollable: find.byType(Scrollable).first,
     );
-    expect(saveBtn.onPressed, isNull);
+    final saveBtn = tester.widget<ButtonStyleButton>(saveBtnFinder);
+    expect(saveBtn.enabled, isFalse);
   });
 }
