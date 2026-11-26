@@ -1,20 +1,23 @@
 enum QualityPreset {
   passthrough(
     wireValue: 'passthrough',
+    segmentLabel: '原画秒转',
     title: '原画直通（秒转 · 零重压）',
-    subtitle: '不重新压制视频画面，仅封装实况容器与元数据，1～3 秒极速生成',
+    subtitle: '不重新压制视频画面，仅封装实况容器与元数据，1～3 秒极速出图',
     shortSideLimit: null,
     videoBitrate: null,
   ),
   p1080(
     wireValue: '1080p',
+    segmentLabel: '1080p 均衡',
     title: '1080p 高清均衡（推荐）',
-    subtitle: '硬件加速控制在约 6 Mbps，画质清晰且几分钟长视频相册滑动不卡顿',
+    subtitle: '硬件加速控制在约 6 Mbps，画质通透且几分钟长视频相册滑动不卡顿',
     shortSideLimit: 1080,
     videoBitrate: 6000000,
   ),
   p720(
     wireValue: '720p',
+    segmentLabel: '720p 省流',
     title: '720p 省空间（超长视频专用）',
     subtitle: '硬件加速控制在约 2.8 Mbps，适合 5～30 分钟超长视频完整收藏',
     shortSideLimit: 720,
@@ -23,6 +26,7 @@ enum QualityPreset {
 
   const QualityPreset({
     required this.wireValue,
+    required this.segmentLabel,
     required this.title,
     required this.subtitle,
     required this.shortSideLimit,
@@ -30,6 +34,7 @@ enum QualityPreset {
   });
 
   final String wireValue;
+  final String segmentLabel;
   final String title;
   final String subtitle;
   final int? shortSideLimit;

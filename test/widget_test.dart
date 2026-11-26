@@ -2,10 +2,13 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
+import 'package:long_live_photo/constants/app_branding.dart';
 import 'package:long_live_photo/main.dart';
 import 'package:long_live_photo/models/conversion_options.dart';
 import 'package:long_live_photo/services/live_photo_channel.dart';
 import 'package:long_live_photo/utils/motion_photo_spec.dart';
+import 'package:long_live_photo/widgets/filmstrip_scrubber.dart';
 import 'package:material_ui/material_ui.dart';
 
 class _FakeGateway implements LivePhotoConverterGateway {
@@ -26,9 +29,21 @@ class _FakeGateway implements LivePhotoConverterGateway {
       platformFormat: 'Mock Live Photo',
     );
   }
+
+  @override
+  Future<List<Uint8List>> extractThumbnails({
+    required String videoPath,
+    int count = 8,
+  }) async {
+    return const <Uint8List>[];
+  }
 }
 
 void main() {
+  setUpAll(() async {
+    await LiquidGlassWidgets.initialize(enablePerformanceMonitor: false);
+  });
+
   group('Formatting utilities', () {
     test('formatPreciseDuration formats short and multi-hour durations', () {
       expect(
@@ -53,13 +68,12 @@ void main() {
 
   group('MotionPhotoSpec XMP & binary packaging', () {
     test('injects dual-standard XMP APP1 and appends MP4 trailer accurately', () {
-      // Minimal synthetic JPEG: SOI + APP0 (JFIF) + SOS + scan byte + EOI
       final minimalJpeg = Uint8List.fromList(<int>[
-        0xFF, 0xD8, // SOI
-        0xFF, 0xE0, 0x00, 0x06, 0x4A, 0x46, 0x49, 0x46, // APP0
-        0xFF, 0xDA, 0x00, 0x04, 0x00, 0x01, // SOS
-        0x7F, // compressed scan payload
-        0xFF, 0xD9, // EOI
+        0xFF, 0xD8,
+        0xFF, 0xE0, 0x00, 0x06, 0x4A, 0x46, 0x49, 0x46,
+        0xFF, 0xDA, 0x00, 0x04, 0x00, 0x01,
+        0x7F,
+        0xFF, 0xD9,
       ]);
       final fakeMp4 = Uint8List.fromList(
         ascii.encode('0000ftypisom_unlimited_duration_mp4_payload_stream'),
@@ -71,20 +85,14 @@ void main() {
         presentationTimestampUs: 1250000,
       );
 
-      // Must start with JPEG SOI
       expect(motionFile[0], 0xFF);
       expect(motionFile[1], 0xD8);
 
-      // Trailer offset math: FileSize - MicroVideoOffset == exact MP4 start
       final mp4Start = motionFile.length - fakeMp4.length;
       expect(motionFile[mp4Start - 2], 0xFF);
       expect(motionFile[mp4Start - 1], 0xD9);
-      expect(
-        motionFile.sublist(mp4Start),
-        equals(fakeMp4),
-      );
+      expect(motionFile.sublist(mp4Start), equals(fakeMp4));
 
-      // Verify embedded XMP metadata string
       final fullLatin1 = latin1.decode(motionFile);
       expect(fullLatin1, contains('http://ns.adobe.com/xap/1.0/'));
       expect(fullLatin1, contains('GCamera:MotionPhoto="1"'));
@@ -97,25 +105,66 @@ void main() {
     });
   });
 
-  testWidgets('ConverterHomePage renders controls and presets properly', (
+  testWidgets('Liquid Glass Studio renders one-screen canvas without overflow', (
     WidgetTester tester,
   ) async {
-    await tester.pumpWidget(LongLivePhotoApp(gateway: _FakeGateway()));
+    tester.view.physicalSize = const Size(390 * 3, 844 * 3);
+    tester.view.devicePixelRatio = 3.0;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
 
-    expect(find.text('长实况 · 全时长视频转实况'), findsOneWidget);
-    expect(find.text('从相册选视频'), findsOneWidget);
-    expect(find.text('从文件选视频'), findsOneWidget);
-    expect(find.text('原画直通（秒转 · 零重压）'), findsOneWidget);
-    expect(find.text('1080p 高清均衡（推荐）'), findsOneWidget);
-    expect(find.text('720p 省空间（超长视频专用）'), findsOneWidget);
-
-    final saveBtnFinder = find.byKey(const Key('convert_save_button'));
-    await tester.scrollUntilVisible(
-      saveBtnFinder,
-      200,
-      scrollable: find.byType(Scrollable).first,
+    await tester.pumpWidget(
+      LiquidGlassWidgets.wrap(
+        brightnessResolver: Theme.maybeBrightnessOf,
+        theme: const GlassThemeData.minimal(),
+        child: LongLivePhotoApp(gateway: _FakeGateway()),
+      ),
     );
-    final saveBtn = tester.widget<ButtonStyleButton>(saveBtnFinder);
+    await tester.pump(const Duration(milliseconds: 100));
+
+    expect(find.text(AppBranding.appName), findsOneWidget);
+    expect(find.text('从相册选视频'), findsOneWidget);
+    expect(find.text('从文件导入'), findsOneWidget);
+    expect(find.text('原画秒转'), findsOneWidget);
+    expect(find.text('1080p 均衡'), findsOneWidget);
+    expect(find.text('720p 省流'), findsOneWidget);
+
+    final saveBtn = tester.widget<GlassButton>(
+      find.byKey(const Key('convert_save_button')),
+    );
     expect(saveBtn.enabled, isFalse);
+  });
+
+  testWidgets('FilmstripScrubber maps horizontal tap and micro-steps accurately', (
+    WidgetTester tester,
+  ) async {
+    int? scrubbedMs;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            width: 400,
+            child: FilmstripScrubber(
+              thumbnails: const <Uint8List>[],
+              coverTimeMs: 5000,
+              totalDurationMs: 10000,
+              enabled: true,
+              onScrubToMs: (int ms) => scrubbedMs = ms,
+              onUseCurrentFrame: () => scrubbedMs = 7777,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('+0.1s'));
+    await tester.pump();
+    expect(scrubbedMs, 5100);
+
+    await tester.tap(find.text('当前帧'));
+    await tester.pump();
+    expect(scrubbedMs, 7777);
   });
 }

@@ -26,38 +26,52 @@ class MainActivity : FlutterActivity() {
 
         MethodChannel(messenger, "com.longlive.long_live_photo/converter")
             .setMethodCallHandler { call, result ->
-                if (call.method != "convertAndSave") {
-                    result.notImplemented()
-                    return@setMethodCallHandler
-                }
-                val videoPath = call.argument<String>("videoPath")
-                if (videoPath.isNullOrBlank()) {
-                    result.error("INVALID_ARGS", "缺少视频路径参数", null)
-                    return@setMethodCallHandler
-                }
-                val coverTimeMs = call.argument<Number>("coverTimeMs")?.toLong() ?: 0L
-                val quality = call.argument<String>("quality") ?: "1080p"
-                val keepAudio = call.argument<Boolean>("keepAudio") ?: true
+                when (call.method) {
+                    "convertAndSave" -> {
+                        val videoPath = call.argument<String>("videoPath")
+                        if (videoPath.isNullOrBlank()) {
+                            result.error("INVALID_ARGS", "缺少视频路径参数", null)
+                            return@setMethodCallHandler
+                        }
+                        val coverTimeMs = call.argument<Number>("coverTimeMs")?.toLong() ?: 0L
+                        val quality = call.argument<String>("quality") ?: "1080p"
+                        val keepAudio = call.argument<Boolean>("keepAudio") ?: true
 
-                converter?.convertAndSaveAsync(
-                    videoPath = videoPath,
-                    coverTimeMs = coverTimeMs,
-                    quality = quality,
-                    keepAudio = keepAudio,
-                    onSuccess = { outcome ->
-                        result.success(
-                            mapOf(
-                                "savedTarget" to outcome.savedUri,
-                                "outputSizeBytes" to outcome.outputSizeBytes,
-                                "elapsedMs" to outcome.elapsedMs,
-                                "platformFormat" to "Android Motion Photo (MVIMG JPG+MP4)",
-                            )
+                        converter?.convertAndSaveAsync(
+                            videoPath = videoPath,
+                            coverTimeMs = coverTimeMs,
+                            quality = quality,
+                            keepAudio = keepAudio,
+                            onSuccess = { outcome ->
+                                result.success(
+                                    mapOf(
+                                        "savedTarget" to outcome.savedUri,
+                                        "outputSizeBytes" to outcome.outputSizeBytes,
+                                        "elapsedMs" to outcome.elapsedMs,
+                                        "platformFormat" to "Android Motion Photo (MVIMG JPG+MP4)",
+                                    )
+                                )
+                            },
+                            onError = { code, msg ->
+                                result.error(code, msg, null)
+                            },
                         )
-                    },
-                    onError = { code, msg ->
-                        result.error(code, msg, null)
-                    },
-                )
+                    }
+
+                    "extractThumbnails" -> {
+                        val videoPath = call.argument<String>("videoPath")
+                        if (videoPath.isNullOrBlank()) {
+                            result.success(emptyList<ByteArray>())
+                            return@setMethodCallHandler
+                        }
+                        val count = call.argument<Number>("count")?.toInt() ?: 8
+                        converter?.extractThumbnailsAsync(videoPath, count) { frames ->
+                            result.success(frames)
+                        }
+                    }
+
+                    else -> result.notImplemented()
+                }
             }
 
         EventChannel(messenger, "com.longlive.long_live_photo/progress")

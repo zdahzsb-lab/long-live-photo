@@ -1,5 +1,7 @@
 import 'dart:async';
+
 import 'package:flutter/services.dart';
+
 import '../models/conversion_options.dart';
 
 abstract class LivePhotoConverterGateway {
@@ -10,6 +12,11 @@ abstract class LivePhotoConverterGateway {
     required int coverTimeMs,
     required QualityPreset quality,
     required bool keepAudio,
+  });
+
+  Future<List<Uint8List>> extractThumbnails({
+    required String videoPath,
+    int count = 8,
   });
 }
 
@@ -61,5 +68,25 @@ class NativeLivePhotoChannel implements LivePhotoConverterGateway {
     }
 
     return ConversionResult.fromMap(response);
+  }
+
+  @override
+  Future<List<Uint8List>> extractThumbnails({
+    required String videoPath,
+    int count = 8,
+  }) async {
+    try {
+      final rawList = await _methodChannel.invokeListMethod<Object?>(
+        'extractThumbnails',
+        <String, Object?>{
+          'videoPath': videoPath,
+          'count': count,
+        },
+      );
+      if (rawList == null) return const <Uint8List>[];
+      return rawList.whereType<Uint8List>().toList(growable: false);
+    } catch (_) {
+      return const <Uint8List>[];
+    }
   }
 }

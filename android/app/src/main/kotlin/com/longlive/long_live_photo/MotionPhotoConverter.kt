@@ -461,4 +461,67 @@ class MotionPhotoConverter(
             throw e
         }
     }
+
+    fun extractThumbnailsAsync(
+        videoPath: String,
+        count: Int,
+        onResult: (List<ByteArray>) -> Unit,
+    ) {
+        workerExecutor.execute {
+            val frames = ArrayList<ByteArray>(count)
+            val file = File(videoPath)
+            if (!file.exists()) {
+                mainHandler.post { onResult(frames) }
+                return@execute
+            }
+            val retriever = MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(file.absolutePath)
+                val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                    ?.toLongOrNull() ?: 1000L
+                val rawW = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+                    ?.toIntOrNull() ?: 1080
+                val rawH = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+                    ?.toIntOrNull() ?: 1920
+                val maxDim = 180.0
+                val scale = min(1.0, maxDim / maxOf(rawW, rawH).coerceAtLeast(1).toDouble())
+                val dstW = (rawW * scale).toInt().coerceAtLeast(32)
+                val dstH = (rawH * scale).toInt().coerceAtLeast(32)
+
+                val safeCount = count.coerceIn(1, 16)
+                for (i in 0 until safeCount) {
+                    val ratio = if (safeCount == 1) 0.0 else i.toDouble() / (safeCount - 1).toDouble()
+                    val tsUs = ((durationMs * ratio).toLong().coerceAtLeast(0L)) * 1000L
+                    val bmp: Bitmap? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                        retriever.getScaledFrameAtTime(
+                            tsUs,
+                            MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                            dstW,
+                            dstH
+                        )
+                    } else {
+                        retriever.getFrameAtTime(tsUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)?.let { raw ->
+                            val scaled = Bitmap.createScaledBitmap(raw, dstW, dstH, true)
+                            if (scaled !== raw) raw.recycle()
+                            scaled
+                        }
+                    }
+
+                    if (bmp != null) {
+                        val out = ByteArrayOutputStream(16 * 1024)
+                        bmp.compress(Bitmap.CompressFormat.JPEG, 72, out)
+                        bmp.recycle()
+                        frames.add(out.toByteArray())
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                try {
+                    retriever.release()
+                } catch (_: Exception) {
+                }
+            }
+            mainHandler.post { onResult(frames) }
+        }
+    }
 }

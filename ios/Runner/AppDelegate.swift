@@ -26,26 +26,37 @@ import CoreMedia
       binaryMessenger: messenger
     )
     methodChannel.setMethodCallHandler { [weak self] (call: FlutterMethodCall, result: @escaping FlutterResult) in
-      guard call.method == "convertAndSave" else {
-        result(FlutterMethodNotImplemented)
-        return
-      }
-      guard let args = call.arguments as? [String: Any],
-            let videoPath = args["videoPath"] as? String else {
-        result(FlutterError(code: "INVALID_ARGS", message: "缺少视频文件路径参数", details: nil))
-        return
-      }
-      let coverTimeMs = (args["coverTimeMs"] as? NSNumber)?.int64Value ?? 0
-      let quality = (args["quality"] as? String) ?? "1080p"
-      let keepAudio = (args["keepAudio"] as? Bool) ?? true
+      switch call.method {
+      case "convertAndSave":
+        guard let args = call.arguments as? [String: Any],
+              let videoPath = args["videoPath"] as? String else {
+          result(FlutterError(code: "INVALID_ARGS", message: "缺少视频文件路径参数", details: nil))
+          return
+        }
+        let coverTimeMs = (args["coverTimeMs"] as? NSNumber)?.int64Value ?? 0
+        let quality = (args["quality"] as? String) ?? "1080p"
+        let keepAudio = (args["keepAudio"] as? Bool) ?? true
 
-      self?.handleConvertAndSave(
-        videoPath: videoPath,
-        coverTimeMs: coverTimeMs,
-        quality: quality,
-        keepAudio: keepAudio,
-        result: result
-      )
+        self?.handleConvertAndSave(
+          videoPath: videoPath,
+          coverTimeMs: coverTimeMs,
+          quality: quality,
+          keepAudio: keepAudio,
+          result: result
+        )
+
+      case "extractThumbnails":
+        guard let args = call.arguments as? [String: Any],
+              let videoPath = args["videoPath"] as? String else {
+          result(FlutterError(code: "INVALID_ARGS", message: "缺少视频文件路径参数", details: nil))
+          return
+        }
+        let count = max(1, min((args["count"] as? NSNumber)?.intValue ?? 8, 16))
+        self?.handleExtractThumbnails(videoPath: videoPath, count: count, result: result)
+
+      default:
+        result(FlutterMethodNotImplemented)
+      }
     }
 
     let progressChannel = FlutterEventChannel(
@@ -88,7 +99,7 @@ import CoreMedia
         DispatchQueue.main.async {
           result(FlutterError(
             code: "PHOTO_PERMISSION_DENIED",
-            message: "请在系统“设置 → 隐私与安全性 → 照片”中允许“长实况”添加照片",
+            message: "请在系统“设置 → 隐私与安全性 → 照片”中允许 Unclip 添加照片",
             details: nil
           ))
         }
@@ -548,5 +559,41 @@ import CoreMedia
       tx: -rect.origin.x,
       ty: -rect.origin.y
     )
+  }
+
+  private func handleExtractThumbnails(
+    videoPath: String,
+    count: Int,
+    result: @escaping FlutterResult
+  ) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      let inputURL = URL(fileURLWithPath: videoPath)
+      guard FileManager.default.fileExists(atPath: inputURL.path) else {
+        DispatchQueue.main.async { result([FlutterStandardTypedData]()) }
+        return
+      }
+      let asset = AVURLAsset(url: inputURL)
+      let totalSeconds = max(CMTimeGetSeconds(asset.duration), 0.1)
+      let generator = AVAssetImageGenerator(asset: asset)
+      generator.appliesPreferredTrackTransform = true
+      generator.maximumSize = CGSize(width: 200, height: 140)
+      let tol = CMTime(seconds: min(0.4, totalSeconds / Double(max(count * 2, 2))), preferredTimescale: 600)
+      generator.requestedTimeToleranceBefore = tol
+      generator.requestedTimeToleranceAfter = tol
+
+      var frames: [FlutterStandardTypedData] = []
+      for i in 0..<count {
+        let fraction = count == 1 ? 0.0 : Double(i) / Double(count - 1)
+        let sec = min(max(totalSeconds * fraction, 0.0), max(totalSeconds - 0.05, 0.0))
+        let cmTime = CMTime(seconds: sec, preferredTimescale: 600)
+        if let cgImg = try? generator.copyCGImage(at: cmTime, actualTime: nil),
+           let jpegData = UIImage(cgImage: cgImg).jpegData(compressionQuality: 0.72) {
+          frames.append(FlutterStandardTypedData(bytes: jpegData))
+        }
+      }
+      DispatchQueue.main.async {
+        result(frames)
+      }
+    }
   }
 }
