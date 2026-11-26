@@ -263,7 +263,7 @@ import CoreMedia
     }
 
     let properties: [String: Any] = [
-      kCGImagePropertyLossyCompressionQuality as String: 0.92,
+      kCGImageDestinationLossyCompressionQuality as String: 0.92,
       kCGImagePropertyMakerAppleDictionary as String: [
         "17": assetIdentifier
       ]
