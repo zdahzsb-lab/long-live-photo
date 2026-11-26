@@ -11,7 +11,9 @@
 
 ## 2. Architecture Overview
 - **App Name**: `Unclip` (`lib/constants/app_branding.dart`, `AndroidManifest.xml`, `ios/Runner/Info.plist`).
-- **UI Layer**: `liquid_glass_widgets` (`^1.21.0`, iOS 27 preset), `lucide_icons_flutter`, `flutter_animate`, and `package:material_ui/material_ui.dart` (do **not** import deprecated `package:flutter/material.dart` or `package:flutter/cupertino.dart` on Flutter 3.50+).
+- **UI Layer**: `liquid_glass_widgets` (`^1.21.0`, iOS 27 preset), `lucide_icons_flutter`, `flutter_animate`, `StudioTokens` (`lib/theme/studio_tokens.dart`), `TactilePressable` (`lib/widgets/tactile_pressable.dart`), and `package:material_ui/material_ui.dart` (do **not** import deprecated `package:flutter/material.dart` or `package:flutter/cupertino.dart` on Flutter 3.50+).
+  - Keep `DefaultTextStyle(decoration: TextDecoration.none)` + `Material(type: MaterialType.transparency)` in `MaterialApp.builder` because `GlassScaffold` wraps `CupertinoPageScaffold` (which otherwise inherits `WidgetsApp`'s yellow double-underline fallback).
+  - Keep `extendBody: false` on `GlassScaffold` so `GlassAppBar` never overlaps `VideoStageCard` or blocks top-corner HUD touch targets (`>= 48dp`).
   - Never nest refractive glass widgets (`GlassButton`, `GlassSegmentedControl`, `GlassIconButton`) inside a `glass`-mode `GlassContainer`.
   - `GlassButton` uses non-nullable `onTap` + `enabled` bool; `GlassIconButton` uses `onPressed`.
 - **iOS Native Engine** (`ios/Runner/AppDelegate.swift`):

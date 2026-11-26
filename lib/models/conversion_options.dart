@@ -2,24 +2,24 @@ enum QualityPreset {
   passthrough(
     wireValue: 'passthrough',
     segmentLabel: '原画秒转',
-    title: '原画直通（秒转 · 零重压）',
-    subtitle: '不重新压制视频画面，仅封装实况容器与元数据，1～3 秒极速出图',
+    title: '原画直通 · 零重压',
+    subtitle: '保留原始画质直接封装实况容器，1～3 秒极速成片',
     shortSideLimit: null,
     videoBitrate: null,
   ),
   p1080(
     wireValue: '1080p',
     segmentLabel: '1080p 均衡',
-    title: '1080p 高清均衡（推荐）',
-    subtitle: '硬件加速控制在约 6 Mbps，画质通透且几分钟长视频相册滑动不卡顿',
+    title: '1080p 高清均衡',
+    subtitle: '硬件加速约 6 Mbps，长视频画质通透且相册滑动丝滑',
     shortSideLimit: 1080,
     videoBitrate: 6000000,
   ),
   p720(
     wireValue: '720p',
     segmentLabel: '720p 省流',
-    title: '720p 省空间（超长视频专用）',
-    subtitle: '硬件加速控制在约 2.8 Mbps，适合 5～30 分钟超长视频完整收藏',
+    title: '720p 轻量省空间',
+    subtitle: '硬件加速约 2.8 Mbps，适合 5～30 分钟超长视频收藏',
     shortSideLimit: 720,
     videoBitrate: 2800000,
   );
@@ -39,6 +39,29 @@ enum QualityPreset {
   final String subtitle;
   final int? shortSideLimit;
   final int? videoBitrate;
+
+  /// Estimates output Live Photo size based on source bytes, duration, and audio toggle.
+  int estimateOutputBytes({
+    required int sourceSizeBytes,
+    required Duration duration,
+    required bool keepAudio,
+  }) {
+    const int coverJpegOverhead = 650 * 1024;
+    if (videoBitrate == null) {
+      if (sourceSizeBytes <= 0) return 0;
+      final audioFactor = keepAudio ? 1.0 : 0.94;
+      return (sourceSizeBytes * audioFactor).round() + coverJpegOverhead;
+    }
+    final seconds = duration.inMilliseconds / 1000.0;
+    if (seconds <= 0) return sourceSizeBytes;
+    final audioBps = keepAudio ? 160000 : 0;
+    final rawEncoded = ((videoBitrate! + audioBps) / 8.0 * seconds).round();
+    final estimated = rawEncoded + coverJpegOverhead;
+    if (sourceSizeBytes > 0 && estimated > (sourceSizeBytes * 1.15).round()) {
+      return sourceSizeBytes + coverJpegOverhead;
+    }
+    return estimated;
+  }
 }
 
 class ConversionProgress {
