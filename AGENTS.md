@@ -15,10 +15,12 @@
   - Zero `BackdropFilter` / glass shader overhead: crisp Zinc monochrome palette (`#09090B` / `#121215` / `#FAFAFA`), `1px` translucent hairlines, and explicit `TextDecoration.none` across all typography.
   - Every interactive control builds on `Pressable` (`Listener.onPointerDown` 0ms trigger + continuous `SpringSimulation` physics + `>= 44×44pt` opaque hit boxes).
 - **iOS Native Engine** (`ios/Runner/AppDelegate.swift`):
-  - Uses `FlutterImplicitEngineDelegate` (`didInitializeImplicitFlutterEngine`) for `MethodChannel('com.longlive.long_live_photo/converter')` and `EventChannel('com.longlive.long_live_photo/progress')`.
+  - Uses `FlutterImplicitEngineDelegate` (`didInitializeImplicitFlutterEngine`) for `MethodChannel('com.longlive.long_live_photo/converter')` (`convertAndSave`, `cancelConversion`, `extractThumbnails`) and `EventChannel('com.longlive.long_live_photo/progress')`.
   - Generates paired `JPG` (`MakerApple` key `"17"`) + QuickTime `MOV` (`com.apple.quicktime.content.identifier` + `mdta/com.apple.quicktime.still-image-time` timed metadata track), preserving scaled rotation translation via `scaledTransform`, and saves via `PHAssetCreationRequest`.
+  - Supports external static cover normalization (`CGImageSourceCreateThumbnailAtIndex` upright + `<= 4096px`), source `creationDate` + ISO 6709 `CLLocation` preservation, `AVAssetReader.timeRange` trimming with matched `writer.startSession(atSourceTime:)` (disabling raw passthrough when trimmed), `isIdleTimerDisabled` + `UIBackgroundTaskIdentifier` keep-awake, and thread-safe cancellation.
 - **Android Native Engine** (`android/app/src/main/kotlin/com/longlive/long_live_photo/`):
-  - `MotionPhotoConverter.kt` + `MotionPhotoXmpInjector.kt`: Lossless `MediaMuxer` passthrough or `androidx.media3:media3-transformer:1.9.2` (matched with `video_player_android`), dual-standard XMP (`GCamera:MotionPhoto` + `GCamera:MicroVideoOffset`), 64KB streaming write into `MediaStore` (`DCIM/Camera/MVIMG_*.jpg` with `IS_PENDING`).
+  - `MotionPhotoConverter.kt` + `MotionPhotoXmpInjector.kt`: Lossless `MediaMuxer` passthrough (untrimmed only) or `androidx.media3:media3-transformer:1.9.2` (`MediaItem.ClippingConfiguration` when trimmed), dual-standard XMP (`GCamera:MotionPhoto` + `GCamera:MicroVideoOffset`), 64KB streaming write into `MediaStore` (`DCIM/Camera/MVIMG_*.jpg` with `IS_PENDING`).
+  - Supports external cover decoding/EXIF orientation normalization (`<= 4096px`), original `METADATA_KEY_DATE` + `METADATA_KEY_LOCATION` preservation (**EXIF written via `androidx.exifinterface:exifinterface:1.4.2` BEFORE `MotionPhotoXmpInjector` & MP4 append**), `FLAG_KEEP_SCREEN_ON` keep-awake, and main-thread `Transformer.cancel()` + `CountDownLatch` release.
 
 ## 3. Verification & CI Rules
 - Always run `flutter analyze --fatal-infos --fatal-warnings` and `flutter test` locally before pushing.

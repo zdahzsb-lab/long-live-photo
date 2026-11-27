@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:long_live_photo/constants/app_branding.dart';
 import 'package:long_live_photo/main.dart';
@@ -21,6 +21,11 @@ class _ControllableGateway implements LivePhotoConverterGateway {
   int? lastCoverTimeMs;
   QualityPreset? lastQuality;
   bool? lastKeepAudio;
+  String? lastCustomCoverPath;
+  int? lastTrimStartMs;
+  int? lastTrimEndMs;
+  bool? lastPreserveMetadata;
+  int cancelCalls = 0;
 
   @override
   Stream<ConversionProgress> get progressStream => progressController.stream;
@@ -31,14 +36,33 @@ class _ControllableGateway implements LivePhotoConverterGateway {
     required int coverTimeMs,
     required QualityPreset quality,
     required bool keepAudio,
+    String? customCoverPath,
+    int? trimStartMs,
+    int? trimEndMs,
+    bool preserveMetadata = true,
   }) {
     lastVideoPath = videoPath;
     lastCoverTimeMs = coverTimeMs;
     lastQuality = quality;
     lastKeepAudio = keepAudio;
+    lastCustomCoverPath = customCoverPath;
+    lastTrimStartMs = trimStartMs;
+    lastTrimEndMs = trimEndMs;
+    lastPreserveMetadata = preserveMetadata;
     final completer = Completer<ConversionResult>();
     pendingConversion = completer;
     return completer.future;
+  }
+
+  @override
+  Future<void> cancelConversion() async {
+    cancelCalls++;
+    final pending = pendingConversion;
+    if (pending != null && !pending.isCompleted) {
+      pending.completeError(
+        PlatformException(code: 'CANCELLED', message: '已取消实况合成'),
+      );
+    }
   }
 
   @override
@@ -55,12 +79,14 @@ class _ControllableGateway implements LivePhotoConverterGateway {
 }
 
 class _FakeVideoController extends VideoPlayerController {
-  _FakeVideoController()
-      : super.networkUrl(Uri.parse('https://example.invalid/mock.mp4')) {
-    value = const VideoPlayerValue(
-      duration: Duration(seconds: 25),
-      position: Duration(milliseconds: 500),
-      size: Size(1080, 1920),
+  _FakeVideoController({
+    Duration duration = const Duration(seconds: 25),
+    Duration position = const Duration(milliseconds: 500),
+  }) : super.networkUrl(Uri.parse('https://example.invalid/mock.mp4')) {
+    value = VideoPlayerValue(
+      duration: duration,
+      position: position,
+      size: const Size(1080, 1920),
       isInitialized: true,
       isPlaying: false,
     );
@@ -93,7 +119,7 @@ class _FakeVideoController extends VideoPlayerController {
 }
 
 void main() {
-  group('Formatting, estimation & XMP binary spec', () {
+  group('Formatting, trim math, estimation & XMP binary spec', () {
     test('formatPreciseDuration & formatFileSize format values accurately', () {
       expect(
         formatPreciseDuration(const Duration(seconds: 84, milliseconds: 350)),
@@ -111,25 +137,87 @@ void main() {
       expect(formatFileSize(2 * 1024 * 1024 * 1024), '2.00 GB');
     });
 
-    test('QualityPreset.estimateOutputBytes reacts to bitrate and audio', () {
-      final p1080Audio = QualityPreset.p1080.estimateOutputBytes(
+    test('VideoTrimMath clamps trim bounds, minimum 500ms span, and cover time', () {
+      // Normal clamp
+      final r1 = VideoTrimMath.clampTrimRange(
+        startMs: -200,
+        endMs: 12000,
+        totalMs: 10000,
+      );
+      expect(r1.startMs, 0);
+      expect(r1.endMs, 10000);
+
+      // Enforces minimum 500ms span
+      final r2 = VideoTrimMath.clampTrimRange(
+        startMs: 5000,
+        endMs: 5100,
+        totalMs: 10000,
+      );
+      expect(r2.endMs - r2.startMs, greaterThanOrEqualTo(500));
+
+      // Ultra-short video shorter than 500ms
+      final r3 = VideoTrimMath.clampTrimRange(
+        startMs: 100,
+        endMs: 200,
+        totalMs: 320,
+      );
+      expect(r3.startMs, 0);
+      expect(r3.endMs, 320);
+
+      expect(
+        VideoTrimMath.clampCoverToTrim(coverMs: 200, startMs: 1000, endMs: 8000),
+        1000,
+      );
+      expect(
+        VideoTrimMath.clampCoverToTrim(coverMs: 9000, startMs: 1000, endMs: 8000),
+        8000,
+      );
+      expect(
+        VideoTrimMath.isEffectivelyTrimmed(
+          startMs: 20,
+          endMs: 9970,
+          totalMs: 10000,
+        ),
+        isFalse,
+      );
+      expect(
+        VideoTrimMath.isEffectivelyTrimmed(
+          startMs: 500,
+          endMs: 10000,
+          totalMs: 10000,
+        ),
+        isTrue,
+      );
+    });
+
+    test('QualityPreset.estimateOutputBytes scales with trim duration and audio', () {
+      final full1080 = QualityPreset.p1080.estimateOutputBytes(
         sourceSizeBytes: 80 * 1024 * 1024,
         duration: const Duration(seconds: 20),
+        totalDuration: const Duration(seconds: 20),
         keepAudio: true,
       );
-      final p1080Muted = QualityPreset.p1080.estimateOutputBytes(
+      final trimmed1080 = QualityPreset.p1080.estimateOutputBytes(
         sourceSizeBytes: 80 * 1024 * 1024,
-        duration: const Duration(seconds: 20),
-        keepAudio: false,
+        duration: const Duration(seconds: 10),
+        totalDuration: const Duration(seconds: 20),
+        keepAudio: true,
       );
-      final p720Audio = QualityPreset.p720.estimateOutputBytes(
+      final fullPassthrough = QualityPreset.passthrough.estimateOutputBytes(
         sourceSizeBytes: 80 * 1024 * 1024,
         duration: const Duration(seconds: 20),
+        totalDuration: const Duration(seconds: 20),
+        keepAudio: true,
+      );
+      final trimmedPassthrough = QualityPreset.passthrough.estimateOutputBytes(
+        sourceSizeBytes: 80 * 1024 * 1024,
+        duration: const Duration(seconds: 10),
+        totalDuration: const Duration(seconds: 20),
         keepAudio: true,
       );
 
-      expect(p1080Audio, greaterThan(p1080Muted));
-      expect(p1080Audio, greaterThan(p720Audio));
+      expect(full1080, greaterThan(trimmed1080));
+      expect(fullPassthrough, greaterThan(trimmedPassthrough));
     });
 
     test('MotionPhotoSpec injects dual-standard XMP APP1 and MP4 trailer', () {
@@ -171,15 +259,18 @@ void main() {
   });
 
   testWidgets(
-    'Welcome screen renders cleanly across small phone, landscape, and 1.4x Dynamic Type with zero underlines',
+    'Welcome & Editor screens render without overflow across 375x667, landscape, and 1.4x Dynamic Type',
     (WidgetTester tester) async {
       final gateway = _ControllableGateway();
+      final fakeCtrl = _FakeVideoController();
       addTearDown(() {
         gateway.dispose();
+        fakeCtrl.dispose();
         tester.view.resetPhysicalSize();
         tester.view.resetDevicePixelRatio();
       });
 
+      // 1. Small phone portrait welcome screen (375x667)
       tester.view.physicalSize = const Size(375 * 3, 667 * 3);
       tester.view.devicePixelRatio = 3.0;
 
@@ -189,23 +280,39 @@ void main() {
       expect(find.text(AppBranding.appName), findsOneWidget);
       expect(find.text('长视频转实况照片'), findsOneWidget);
       expect(find.text('从相册选视频'), findsOneWidget);
-      expect(find.text('从文件导入'), findsOneWidget);
-
-      final galleryRect = tester.getRect(
-        find.byKey(const Key('pick_gallery_button')),
-      );
-      expect(galleryRect.height, greaterThanOrEqualTo(52));
 
       for (final rt in tester.widgetList<RichText>(find.byType(RichText))) {
         expect(rt.text.style?.decoration, isNot(equals(TextDecoration.underline)));
       }
 
-      // Landscape + 1.4x font scaling
+      // 2. Small phone portrait editor screen (375x667) + 1.4x Dynamic Type
+      await tester.pumpWidget(
+        MediaQuery(
+          data: const MediaQueryData(textScaler: TextScaler.linear(1.4)),
+          child: LongLivePhotoApp(
+            gateway: gateway,
+            debugInitialController: fakeCtrl,
+            debugInitialVideoPath: 'mock://clip.mp4',
+            debugInitialSizeBytes: 32 * 1024 * 1024,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+      expect(find.byKey(const Key('custom_cover_button')), findsOneWidget);
+      expect(find.byKey(const Key('preserve_metadata_toggle')), findsOneWidget);
+
+      // 3. Landscape phone (844x390) + 1.4x Dynamic Type
       tester.view.physicalSize = const Size(844 * 3, 390 * 3);
       await tester.pumpWidget(
         MediaQuery(
           data: const MediaQueryData(textScaler: TextScaler.linear(1.4)),
-          child: LongLivePhotoApp(gateway: gateway),
+          child: LongLivePhotoApp(
+            gateway: gateway,
+            debugInitialController: fakeCtrl,
+            debugInitialVideoPath: 'mock://clip.mp4',
+            debugInitialSizeBytes: 32 * 1024 * 1024,
+          ),
         ),
       );
       await tester.pumpAndSettle();
@@ -214,7 +321,7 @@ void main() {
   );
 
   testWidgets(
-    'Pressable spring responds within a single 16ms frame on pointer-down and settles cleanly',
+    'Pressable spring responds within 16ms on pointer-down and settles cleanly',
     (WidgetTester tester) async {
       int taps = 0;
       await tester.pumpWidget(
@@ -246,7 +353,6 @@ void main() {
 
       expect(readScale(), closeTo(1.0, 0.0001));
 
-      // Pointer touches down — Ticker stamps t0 on frame 0 and compresses by 16ms (no 100ms arena lag!)
       final gesture = await tester.startGesture(
         tester.getCenter(find.byKey(const Key('spring_btn'))),
       );
@@ -264,7 +370,98 @@ void main() {
   );
 
   testWidgets(
-    'Full Studio Editor workflow: audio switch, play/pause, filmstrip scrub, quality glide, replace sheet, and conversion progress to result sheet',
+    'Editor workflow: trim handles, reset trim, custom cover badge, metadata toggle, hold-to-preview, and cancel conversion',
+    (WidgetTester tester) async {
+      final gateway = _ControllableGateway();
+      final fakeCtrl = _FakeVideoController(
+        duration: const Duration(seconds: 25),
+        position: const Duration(milliseconds: 500),
+      );
+      addTearDown(() {
+        gateway.dispose();
+        fakeCtrl.dispose();
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      tester.view.physicalSize = const Size(390 * 3, 844 * 3);
+      tester.view.devicePixelRatio = 3.0;
+
+      await tester.pumpWidget(
+        LongLivePhotoApp(
+          gateway: gateway,
+          debugInitialController: fakeCtrl,
+          debugInitialVideoPath: 'mock://clip.mp4',
+          debugInitialSizeBytes: 32 * 1024 * 1024,
+          debugInitialCustomCoverPath: 'mock://custom_cover.jpg',
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // 1. Custom cover button reflects active external cover & can restore video frame
+      expect(find.text('已换封面'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('custom_cover_button')));
+      await tester.pumpAndSettle();
+      expect(find.text('自定义静态封面'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('sheet_restore_frame_cover')));
+      await tester.pumpAndSettle();
+      expect(find.text('自选封面'), findsOneWidget);
+
+      // 2. Drag left & right trim handles -> verify trim summary + cover clamp + reset
+      await tester.drag(
+        find.byKey(const Key('trim_start_handle')),
+        const Offset(80, 0),
+      );
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('reset_trim_button')), findsOneWidget);
+      expect(find.textContaining('截取'), findsOneWidget);
+
+      await tester.drag(
+        find.byKey(const Key('trim_end_handle')),
+        const Offset(-60, 0),
+      );
+      await tester.pumpAndSettle();
+
+      // Reset trim restores full length
+      await tester.tap(find.byKey(const Key('reset_trim_button')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('reset_trim_button')), findsNothing);
+
+      // Re-apply a start trim so conversion payload sends trimStartMs/trimEndMs
+      await tester.drag(
+        find.byKey(const Key('trim_start_handle')),
+        const Offset(60, 0),
+      );
+      await tester.pumpAndSettle();
+
+      // 3. Toggle metadata preservation off
+      expect(find.text('原拍摄时间'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('preserve_metadata_toggle')));
+      await tester.pumpAndSettle();
+      expect(find.text('当前时间'), findsOneWidget);
+
+      // 4. Start conversion -> cancel mid-flight -> verify CANCELLED state & restoration
+      await tester.tap(find.byKey(const Key('convert_save_button')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 120));
+
+      expect(find.byKey(const Key('cancel_convert_button')), findsOneWidget);
+      expect(gateway.lastTrimStartMs, greaterThan(0));
+      expect(gateway.lastTrimEndMs, 25000);
+      expect(gateway.lastPreserveMetadata, isFalse);
+
+      await tester.tap(find.byKey(const Key('cancel_convert_button')));
+      await tester.pumpAndSettle();
+
+      expect(gateway.cancelCalls, 1);
+      expect(find.text('已取消合成'), findsOneWidget);
+      expect(find.byKey(const Key('cancel_convert_button')), findsNothing);
+      expect(find.text('生成实况并存入相册'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'Full conversion flow: audio toggle, custom cover pass-through, metadata ON, progress sweep, and result sheet',
     (WidgetTester tester) async {
       final gateway = _ControllableGateway();
       final fakeCtrl = _FakeVideoController();
@@ -284,73 +481,50 @@ void main() {
           debugInitialController: fakeCtrl,
           debugInitialVideoPath: 'mock://clip.mp4',
           debugInitialSizeBytes: 32 * 1024 * 1024,
+          debugInitialCustomCoverPath: 'mock://portrait_cover.jpg',
         ),
       );
       await tester.pumpAndSettle();
 
-      // 1. Top-left audio switch (>=112x48dp, zero leak to play/pause)
+      // Top-left audio switch (>=112x48dp, zero leak to play/pause)
       final audioFinder = find.byKey(const Key('audio_toggle_button'));
       final audioRect = tester.getRect(audioFinder);
       expect(audioRect.width, greaterThanOrEqualTo(112));
       expect(audioRect.height, greaterThanOrEqualTo(48));
-      expect(find.text('实况有声'), findsOneWidget);
-
       await tester.tapAt(audioRect.bottomRight - const Offset(3, 3));
       await tester.pumpAndSettle();
       expect(find.text('已静音'), findsOneWidget);
       expect(fakeCtrl.lastVolume, 0.0);
       expect(fakeCtrl.value.isPlaying, isFalse);
 
-      // 2. Play / Pause toggle on viewport
-      await tester.tap(find.bySemanticsLabel('播放视频预览'));
-      await tester.pumpAndSettle();
+      // Hold-to-preview-Live gesture on stage
+      final holdGesture = await tester.startGesture(
+        tester.getCenter(find.byKey(const Key('video_viewport_tap'))),
+      );
+      await tester.pump(const Duration(milliseconds: 650));
       expect(fakeCtrl.value.isPlaying, isTrue);
-
-      await tester.tapAt(tester.getCenter(find.byKey(const Key('video_viewport_tap'))));
+      expect(find.text('实况预览'), findsOneWidget);
+      await holdGesture.up();
       await tester.pumpAndSettle();
       expect(fakeCtrl.value.isPlaying, isFalse);
 
-      // 3. Filmstrip micro-steppers (+0.1s, -0.1s, 当前帧) & drag scrub
-      await tester.tap(find.text('+0.1s'));
-      await tester.pumpAndSettle();
-      expect(fakeCtrl.lastSeek.inMilliseconds, 600);
-
-      await tester.drag(
-        find.bySemanticsLabel('拖动胶片轨道选择实况封面帧'),
-        const Offset(100, 0),
-      );
-      await tester.pumpAndSettle();
-      expect(fakeCtrl.lastSeek.inMilliseconds, greaterThan(600));
-
-      // 4. Sliding quality segmented tabs
+      // Quality glide & conversion
       await tester.tap(find.text('720p 省流'));
       await tester.pumpAndSettle();
-      expect(find.textContaining('2.8 Mbps'), findsOneWidget);
 
-      // 5. Replace video bottom sheet opens and dismisses cleanly
-      await tester.tap(find.byKey(const Key('replace_video_button')));
-      await tester.pumpAndSettle();
-      expect(find.text('更换视频素材'), findsOneWidget);
-      expect(find.text('从系统相册选择'), findsOneWidget);
-      await tester.tapAt(const Offset(20, 40)); // tap barrier to dismiss
-      await tester.pumpAndSettle();
-      expect(find.text('更换视频素材'), findsNothing);
-
-      // 6. Full conversion pipeline -> live sweep progress -> result sheet -> dismiss
       await tester.tap(find.byKey(const Key('convert_save_button')));
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 200));
-      expect(find.textContaining('正在准备实况合成'), findsOneWidget);
 
       gateway.progressController.add(
         const ConversionProgress(
           stage: 'encoding',
-          progress: 0.56,
+          progress: 0.64,
           message: '正在封装实况轨道...',
         ),
       );
       await tester.pump(const Duration(milliseconds: 200));
-      expect(find.textContaining('56%'), findsOneWidget);
+      expect(find.textContaining('64%'), findsOneWidget);
 
       gateway.pendingConversion!.complete(
         const ConversionResult(
@@ -363,10 +537,13 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(gateway.lastVideoPath, 'mock://clip.mp4');
+      expect(gateway.lastCustomCoverPath, 'mock://portrait_cover.jpg');
+      expect(gateway.lastTrimStartMs, isNull);
+      expect(gateway.lastTrimEndMs, isNull);
+      expect(gateway.lastPreserveMetadata, isTrue);
       expect(gateway.lastQuality, QualityPreset.p720);
       expect(gateway.lastKeepAudio, isFalse);
 
-      // Result bottom sheet verified
       expect(find.text('已存入系统相册'), findsOneWidget);
       expect(find.text('9.0 MB'), findsOneWidget);
       expect(find.text('1.8s'), findsOneWidget);

@@ -42,12 +42,14 @@ class LongLivePhotoApp extends StatelessWidget {
     this.debugInitialController,
     this.debugInitialVideoPath,
     this.debugInitialSizeBytes = 0,
+    this.debugInitialCustomCoverPath,
   });
 
   final LivePhotoConverterGateway? gateway;
   final VideoPlayerController? debugInitialController;
   final String? debugInitialVideoPath;
   final int debugInitialSizeBytes;
+  final String? debugInitialCustomCoverPath;
 
   @override
   Widget build(BuildContext context) {
@@ -67,6 +69,7 @@ class LongLivePhotoApp extends StatelessWidget {
         initialController: debugInitialController,
         initialVideoPath: debugInitialVideoPath,
         initialSizeBytes: debugInitialSizeBytes,
+        initialCustomCoverPath: debugInitialCustomCoverPath,
       ),
     );
   }
@@ -79,12 +82,14 @@ class ConverterHomePage extends StatefulWidget {
     this.initialController,
     this.initialVideoPath,
     this.initialSizeBytes = 0,
+    this.initialCustomCoverPath,
   });
 
   final LivePhotoConverterGateway gateway;
   final VideoPlayerController? initialController;
   final String? initialVideoPath;
   final int initialSizeBytes;
+  final String? initialCustomCoverPath;
 
   @override
   State<ConverterHomePage> createState() => _ConverterHomePageState();
@@ -98,18 +103,24 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
   StreamSubscription<ConversionProgress>? _progressSub;
 
   String? _selectedVideoPath;
+  String? _customCoverPath;
   int _sourceSizeBytes = 0;
   List<Uint8List> _thumbnails = const <Uint8List>[];
 
   Duration _videoDuration = Duration.zero;
   Duration _currentPosition = Duration.zero;
   int _coverTimeMs = 0;
+  int _trimStartMs = 0;
+  int _trimEndMs = 0;
 
   QualityPreset _quality = QualityPreset.p1080;
   bool _keepAudio = true;
+  bool _preserveMetadata = true;
 
   bool _isLoadingVideo = false;
   bool _isConverting = false;
+  bool _isLiveHolding = false;
+  bool _wasPlayingBeforeHold = false;
   ConversionProgress? _progress;
 
   @override
@@ -120,9 +131,12 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
       _videoController = seeded;
       _ownsController = false;
       _selectedVideoPath = widget.initialVideoPath ?? 'mock://seeded.mp4';
+      _customCoverPath = widget.initialCustomCoverPath;
       _sourceSizeBytes = widget.initialSizeBytes;
       _videoDuration = seeded.value.duration;
       _currentPosition = seeded.value.position;
+      _trimStartMs = 0;
+      _trimEndMs = _videoDuration.inMilliseconds;
       _coverTimeMs = _videoDuration.inMilliseconds > 600 ? 500 : 0;
       seeded.addListener(_onVideoTick);
     }
@@ -148,6 +162,16 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     final ctrl = _videoController;
     if (ctrl == null || !mounted) return;
     final pos = ctrl.value.position;
+    if (ctrl.value.isPlaying &&
+        _trimEndMs > 0 &&
+        pos.inMilliseconds >= _trimEndMs) {
+      if (_isLiveHolding) {
+        unawaited(ctrl.seekTo(Duration(milliseconds: _trimStartMs)));
+      } else {
+        unawaited(ctrl.pause());
+        unawaited(ctrl.seekTo(Duration(milliseconds: _trimStartMs)));
+      }
+    }
     if ((pos - _currentPosition).inMilliseconds.abs() >= 80 ||
         !ctrl.value.isPlaying) {
       setState(() => _currentPosition = pos);
@@ -161,9 +185,13 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     return 'Studio 预览模式';
   }
 
-  void _showMessage(String msg) {
+  void _showMessage(String msg, {bool isError = true}) {
     if (!mounted) return;
-    HapticFeedback.heavyImpact();
+    if (isError) {
+      HapticFeedback.heavyImpact();
+    } else {
+      playHaptic(Haptic.selection);
+    }
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text(msg)));
@@ -250,6 +278,77 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     }
   }
 
+  Future<void> _pickCustomCoverImage() async {
+    if (_isConverting) return;
+    try {
+      final XFile? image = await _imagePicker.pickImage(
+        source: ImageSource.gallery,
+      );
+      if (image == null || !mounted) return;
+      setState(() => _customCoverPath = image.path);
+    } on PlatformException catch (e) {
+      _showMessage('读取图片失败：${e.message ?? e.code}');
+    } catch (e) {
+      _showMessage('读取图片失败：$e');
+    }
+  }
+
+  Future<void> _handleCustomCoverButton() async {
+    if (_isConverting) return;
+    if (_customCoverPath == null) {
+      await _pickCustomCoverImage();
+      return;
+    }
+
+    final String? action = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: Ui.surface,
+      barrierColor: const Color(0xA6000000),
+      builder: (BuildContext sheetContext) {
+        return SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(Ui.s5, Ui.s1, Ui.s5, Ui.s5),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                const Padding(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: Ui.s1,
+                    vertical: Ui.s2,
+                  ),
+                  child: Text('自定义静态封面', style: Ui.title),
+                ),
+                const SizedBox(height: Ui.s2),
+                SecondaryButton(
+                  key: const Key('sheet_replace_cover'),
+                  label: '从相册重新选择图片',
+                  icon: LucideIcons.images,
+                  onTap: () => Navigator.of(sheetContext).pop('replace'),
+                ),
+                const SizedBox(height: Ui.s2 + 2),
+                SecondaryButton(
+                  key: const Key('sheet_restore_frame_cover'),
+                  label: '恢复使用视频画面帧',
+                  icon: LucideIcons.rotateCcw,
+                  onTap: () => Navigator.of(sheetContext).pop('restore'),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+
+    if (!mounted || action == null) return;
+    if (action == 'replace') {
+      await _pickCustomCoverImage();
+    } else if (action == 'restore') {
+      setState(() => _customCoverPath = null);
+    }
+  }
+
   Future<void> _loadVideoFile(String path) async {
     setState(() {
       _isLoadingVideo = true;
@@ -283,10 +382,14 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
         _videoController = ctrl;
         _ownsController = true;
         _selectedVideoPath = path;
+        _customCoverPath = null;
         _sourceSizeBytes = size;
         _videoDuration = ctrl.value.duration;
         _currentPosition = Duration(milliseconds: defaultCoverMs);
+        _trimStartMs = 0;
+        _trimEndMs = totalMs;
         _coverTimeMs = defaultCoverMs;
+        _isLiveHolding = false;
         _isLoadingVideo = false;
       });
 
@@ -320,8 +423,11 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
   Future<void> _seekCoverTo(int targetMs) async {
     final ctrl = _videoController;
     if (ctrl == null) return;
-    final maxMs = _videoDuration.inMilliseconds;
-    final clamped = targetMs.clamp(0, maxMs > 0 ? maxMs : 0);
+    final clamped = VideoTrimMath.clampCoverToTrim(
+      coverMs: targetMs,
+      startMs: _trimStartMs,
+      endMs: _trimEndMs,
+    );
     setState(() {
       _coverTimeMs = clamped;
       _currentPosition = Duration(milliseconds: clamped);
@@ -332,6 +438,40 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     await ctrl.seekTo(Duration(milliseconds: clamped));
   }
 
+  void _onTrimChanged(int startMs, int endMs) {
+    final totalMs = _videoDuration.inMilliseconds;
+    final clamped = VideoTrimMath.clampTrimRange(
+      startMs: startMs,
+      endMs: endMs,
+      totalMs: totalMs,
+    );
+    final nextCover = VideoTrimMath.clampCoverToTrim(
+      coverMs: _coverTimeMs,
+      startMs: clamped.startMs,
+      endMs: clamped.endMs,
+    );
+    final coverMoved = nextCover != _coverTimeMs;
+    setState(() {
+      _trimStartMs = clamped.startMs;
+      _trimEndMs = clamped.endMs;
+      _coverTimeMs = nextCover;
+      if (coverMoved) {
+        _currentPosition = Duration(milliseconds: nextCover);
+      }
+    });
+    if (coverMoved) {
+      unawaited(_videoController?.seekTo(Duration(milliseconds: nextCover)));
+    }
+  }
+
+  void _resetTrim() {
+    final totalMs = _videoDuration.inMilliseconds;
+    setState(() {
+      _trimStartMs = 0;
+      _trimEndMs = totalMs;
+    });
+  }
+
   Future<void> _togglePlay() async {
     final ctrl = _videoController;
     if (ctrl == null || _isConverting) return;
@@ -339,9 +479,39 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     if (ctrl.value.isPlaying) {
       await ctrl.pause();
     } else {
+      final posMs = ctrl.value.position.inMilliseconds;
+      if (posMs < _trimStartMs || (_trimEndMs > 0 && posMs >= _trimEndMs - 50)) {
+        await ctrl.seekTo(Duration(milliseconds: _trimStartMs));
+      }
       await ctrl.play();
     }
     if (mounted) setState(() {});
+  }
+
+  Future<void> _onLiveHoldStart() async {
+    final ctrl = _videoController;
+    if (ctrl == null || _isConverting) return;
+    playHaptic(Haptic.light);
+    _wasPlayingBeforeHold = ctrl.value.isPlaying;
+    setState(() => _isLiveHolding = true);
+    await ctrl.seekTo(Duration(milliseconds: _trimStartMs));
+    await ctrl.play();
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _onLiveHoldEnd() async {
+    final ctrl = _videoController;
+    if (!_isLiveHolding || ctrl == null) return;
+    setState(() => _isLiveHolding = false);
+    if (!_wasPlayingBeforeHold) {
+      await ctrl.pause();
+      await ctrl.seekTo(Duration(milliseconds: _coverTimeMs));
+      if (mounted) {
+        setState(() {
+          _currentPosition = Duration(milliseconds: _coverTimeMs);
+        });
+      }
+    }
   }
 
   void _toggleAudio() {
@@ -350,6 +520,11 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
       _keepAudio = !_keepAudio;
       _videoController?.setVolume(_keepAudio ? 1.0 : 0.0);
     });
+  }
+
+  Future<void> _cancelConversion() async {
+    if (!_isConverting) return;
+    await widget.gateway.cancelConversion();
   }
 
   Future<void> _startConversion() async {
@@ -361,8 +536,19 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
       await ctrl.pause();
     }
 
+    final totalMs = _videoDuration.inMilliseconds;
+    final isTrimmed = VideoTrimMath.isEffectivelyTrimmed(
+      startMs: _trimStartMs,
+      endMs: _trimEndMs,
+      totalMs: totalMs,
+    );
+    final effectiveDuration = isTrimmed
+        ? Duration(milliseconds: (_trimEndMs - _trimStartMs).clamp(0, totalMs))
+        : _videoDuration;
+
     setState(() {
       _isConverting = true;
+      _isLiveHolding = false;
       _progress = const ConversionProgress(
         stage: 'preparing',
         progress: 0.04,
@@ -376,6 +562,10 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
         coverTimeMs: _coverTimeMs,
         quality: _quality,
         keepAudio: _keepAudio,
+        customCoverPath: _customCoverPath,
+        trimStartMs: isTrimmed ? _trimStartMs : null,
+        trimEndMs: isTrimmed ? _trimEndMs : null,
+        preserveMetadata: _preserveMetadata,
       );
 
       if (!mounted) return;
@@ -387,7 +577,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
 
       await showConversionResultSheet(
         context: context,
-        duration: _videoDuration,
+        duration: effectiveDuration,
         result: result,
       );
     } on PlatformException catch (e) {
@@ -396,7 +586,11 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
         _isConverting = false;
         _progress = null;
       });
-      _showMessage(e.message ?? '合成失败（${e.code}）');
+      if (e.code == 'CANCELLED') {
+        _showMessage('已取消合成', isError: false);
+      } else {
+        _showMessage(e.message ?? '合成失败（${e.code}）');
+      }
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -422,7 +616,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: <Widget>[
-                // Minimalist 52pt Top Header — strictly separated from stage
+                // Minimalist Top Header — strictly separated from stage
                 Padding(
                   padding: const EdgeInsets.fromLTRB(Ui.s5, Ui.s1, Ui.s4, Ui.s1),
                   child: SizedBox(
@@ -545,9 +739,16 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
       );
     }
 
+    final totalMs = _videoDuration.inMilliseconds;
+    final trimmedSpanMs = (_trimEndMs - _trimStartMs).clamp(0, totalMs);
+    final effectiveDuration = trimmedSpanMs > 0
+        ? Duration(milliseconds: trimmedSpanMs)
+        : _videoDuration;
+
     final estimatedBytes = _quality.estimateOutputBytes(
       sourceSizeBytes: _sourceSizeBytes,
-      duration: _videoDuration,
+      duration: effectiveDuration,
+      totalDuration: _videoDuration,
       keepAudio: _keepAudio,
     );
 
@@ -563,9 +764,20 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
       sourceSizeBytes: _sourceSizeBytes,
       keepAudio: _keepAudio,
       isConverting: _isConverting,
+      customCoverPath: _customCoverPath,
+      trimStartMs: _trimStartMs,
+      trimEndMs: _trimEndMs,
+      isLivePreviewing: _isLiveHolding,
       onTogglePlay: _togglePlay,
       onToggleAudio: _toggleAudio,
+      onPickCustomCover: _handleCustomCoverButton,
+      onLiveHoldStart: _onLiveHoldStart,
+      onLiveHoldEnd: _onLiveHoldEnd,
     );
+
+    final subtitleText = estimatedBytes > 0
+        ? '${_quality.subtitle} · 约 ${formatFileSize(estimatedBytes)}'
+        : _quality.subtitle;
 
     return Column(
       key: const ValueKey<String>('state_editor'),
@@ -575,20 +787,25 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
         if (useFlexibleStage)
           Expanded(child: stage)
         else
-          SizedBox(height: 260, child: stage),
-        const SizedBox(height: Ui.s3),
+          SizedBox(height: 250, child: stage),
+        const SizedBox(height: Ui.s2 + 2),
 
-        // 1. Filmstrip Cover Picker
+        // 1. Filmstrip Cover + Trim Range Scrubber
         FilmstripScrubber(
           thumbnails: _thumbnails,
           coverTimeMs: _coverTimeMs,
-          totalDurationMs: _videoDuration.inMilliseconds,
+          totalDurationMs: totalMs,
+          trimStartMs: _trimStartMs,
+          trimEndMs: _trimEndMs,
+          hasCustomCover: _customCoverPath != null,
           enabled: !_isConverting,
           onScrubToMs: _seekCoverTo,
           onUseCurrentFrame: () =>
               _seekCoverTo(_currentPosition.inMilliseconds),
+          onTrimChanged: _onTrimChanged,
+          onResetTrim: _resetTrim,
         ),
-        const SizedBox(height: Ui.s3 + 2),
+        const SizedBox(height: Ui.s3),
 
         // 2. Minimalist Sliding Quality Tabs
         SegmentedTabs<QualityPreset>(
@@ -601,47 +818,120 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
             setState(() => _quality = QualityPreset.values[index]);
           },
         ),
-        const SizedBox(height: Ui.s2),
+        const SizedBox(height: Ui.s1),
 
-        // 3. Preset Subtitle + Estimated Output Size
-        AnimatedSwitcher(
-          duration: Ui.motion(context, Ui.fast),
-          switchInCurve: Ui.easeOut,
-          child: Row(
-            key: ValueKey<String>('${_quality.wireValue}_$_keepAudio'),
-            children: <Widget>[
-              Expanded(
-                child: Text(
-                  _quality.subtitle,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: Ui.caption,
-                ),
-              ),
-              if (estimatedBytes > 0) ...<Widget>[
-                const SizedBox(width: Ui.s2),
-                Text(
-                  '约 ${formatFileSize(estimatedBytes)}',
-                  style: Ui.mono.copyWith(
-                    fontSize: 12,
-                    color: Ui.textSecondary,
+        // 3. Preset Subtitle + Size + Metadata Date/Location Toggle (44pt hit height)
+        Row(
+          children: <Widget>[
+            Expanded(
+              child: AnimatedSwitcher(
+                duration: Ui.motion(context, Ui.fast),
+                switchInCurve: Ui.easeOut,
+                child: Align(
+                  key: ValueKey<String>(subtitleText),
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    subtitleText,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Ui.caption.copyWith(fontFeatures: Ui.tabular),
                   ),
                 ),
-              ],
-            ],
-          ),
+              ),
+            ),
+            const SizedBox(width: Ui.s2),
+            Pressable(
+              key: const Key('preserve_metadata_toggle'),
+              enabled: !_isConverting,
+              toggled: _preserveMetadata,
+              semanticLabel:
+                  _preserveMetadata ? '保留原拍摄时间与地点，点击切换为当前时间' : '使用当前时间存入相册，点击改回原拍摄时间',
+              haptic: Haptic.selection,
+              maxInsetPx: 3.0,
+              minSize: const Size(84, Ui.minTarget),
+              onTap: () {
+                setState(() => _preserveMetadata = !_preserveMetadata);
+              },
+              child: Container(
+                height: 28,
+                padding: const EdgeInsets.symmetric(horizontal: 9),
+                decoration: BoxDecoration(
+                  color: Ui.surface,
+                  borderRadius: BorderRadius.circular(Ui.rSm),
+                  border: Border.all(
+                    color: _preserveMetadata ? Ui.hairlineStrong : Ui.hairline,
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    Container(
+                      width: 5.5,
+                      height: 5.5,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color:
+                            _preserveMetadata ? Ui.liveActive : Ui.textTertiary,
+                      ),
+                    ),
+                    const SizedBox(width: 5),
+                    Text(
+                      _preserveMetadata ? '原拍摄时间' : '当前时间',
+                      style: Ui.caption.copyWith(
+                        fontSize: 11.5,
+                        color: _preserveMetadata
+                            ? Ui.textPrimary
+                            : Ui.textSecondary,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
         ),
-        const SizedBox(height: Ui.s4),
+        const SizedBox(height: Ui.s2),
 
-        // 4. Primary Action Button (morphs into inline progress sweep when busy)
-        PrimaryButton(
-          key: const Key('convert_save_button'),
-          label: '生成实况并存入相册',
-          icon: LucideIcons.arrowDownToLine,
-          enabled: !_isConverting,
-          progress: _isConverting ? (_progress?.progress ?? 0.04) : null,
-          progressLabel: busyLabel,
-          onTap: _startConversion,
+        // 4. Primary Action Row (morphs to Progress + inline Cancel when converting)
+        Row(
+          children: <Widget>[
+            Expanded(
+              child: PrimaryButton(
+                key: const Key('convert_save_button'),
+                label: '生成实况并存入相册',
+                icon: LucideIcons.arrowDownToLine,
+                enabled: !_isConverting,
+                progress: _isConverting ? (_progress?.progress ?? 0.04) : null,
+                progressLabel: busyLabel,
+                onTap: _startConversion,
+              ),
+            ),
+            if (_isConverting) ...<Widget>[
+              const SizedBox(width: Ui.s2),
+              Pressable(
+                key: const Key('cancel_convert_button'),
+                semanticLabel: '取消当前实况合成',
+                haptic: Haptic.light,
+                maxInsetPx: 4.0,
+                minSize: const Size(80, Ui.buttonHeight),
+                onTap: _cancelConversion,
+                child: Container(
+                  width: 80,
+                  height: Ui.buttonHeight,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: Ui.surfaceRaised,
+                    borderRadius: BorderRadius.circular(Ui.rMd + 2),
+                    border: Border.all(color: Ui.hairlineStrong),
+                  ),
+                  child: Text(
+                    '取消',
+                    style: Ui.label.copyWith(color: Ui.textPrimary),
+                  ),
+                ),
+              ),
+            ],
+          ],
         ),
       ],
     );

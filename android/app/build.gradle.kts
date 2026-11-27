@@ -40,6 +40,7 @@ dependencies {
     implementation("androidx.media3:media3-transformer:$media3Version")
     implementation("androidx.media3:media3-effect:$media3Version")
     implementation("androidx.media3:media3-common:$media3Version")
+    implementation("androidx.exifinterface:exifinterface:1.4.2")
 }
 
 flutter {

@@ -12,7 +12,13 @@ abstract class LivePhotoConverterGateway {
     required int coverTimeMs,
     required QualityPreset quality,
     required bool keepAudio,
+    String? customCoverPath,
+    int? trimStartMs,
+    int? trimEndMs,
+    bool preserveMetadata = true,
   });
+
+  Future<void> cancelConversion();
 
   Future<List<Uint8List>> extractThumbnails({
     required String videoPath,
@@ -49,6 +55,10 @@ class NativeLivePhotoChannel implements LivePhotoConverterGateway {
     required int coverTimeMs,
     required QualityPreset quality,
     required bool keepAudio,
+    String? customCoverPath,
+    int? trimStartMs,
+    int? trimEndMs,
+    bool preserveMetadata = true,
   }) async {
     final response = await _methodChannel.invokeMapMethod<Object?, Object?>(
       'convertAndSave',
@@ -57,6 +67,10 @@ class NativeLivePhotoChannel implements LivePhotoConverterGateway {
         'coverTimeMs': coverTimeMs,
         'quality': quality.wireValue,
         'keepAudio': keepAudio,
+        'customCoverPath': customCoverPath,
+        'trimStartMs': trimStartMs,
+        'trimEndMs': trimEndMs,
+        'preserveMetadata': preserveMetadata,
       },
     );
 
@@ -68,6 +82,15 @@ class NativeLivePhotoChannel implements LivePhotoConverterGateway {
     }
 
     return ConversionResult.fromMap(response);
+  }
+
+  @override
+  Future<void> cancelConversion() async {
+    try {
+      await _methodChannel.invokeMethod<void>('cancelConversion');
+    } catch (_) {
+      // Ignore if no active conversion is running on native side.
+    }
   }
 
   @override

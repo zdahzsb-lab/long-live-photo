@@ -45,12 +45,21 @@ enum QualityPreset {
     required int sourceSizeBytes,
     required Duration duration,
     required bool keepAudio,
+    Duration? totalDuration,
   }) {
     const int coverJpegOverhead = 650 * 1024;
     if (videoBitrate == null) {
       if (sourceSizeBytes <= 0) return 0;
       final audioFactor = keepAudio ? 1.0 : 0.94;
-      return (sourceSizeBytes * audioFactor).round() + coverJpegOverhead;
+      final double trimFactor;
+      if (totalDuration != null && totalDuration.inMilliseconds > 0) {
+        trimFactor = (duration.inMilliseconds / totalDuration.inMilliseconds)
+            .clamp(0.02, 1.0);
+      } else {
+        trimFactor = 1.0;
+      }
+      return (sourceSizeBytes * audioFactor * trimFactor).round() +
+          coverJpegOverhead;
     }
     final seconds = duration.inMilliseconds / 1000.0;
     if (seconds <= 0) return sourceSizeBytes;
@@ -61,6 +70,53 @@ enum QualityPreset {
       return sourceSizeBytes + coverJpegOverhead;
     }
     return estimated;
+  }
+}
+
+/// Pure helpers for clamping video trim bounds and cover timestamps.
+abstract final class VideoTrimMath {
+  static const int minClipMs = 500;
+
+  static ({int startMs, int endMs}) clampTrimRange({
+    required int startMs,
+    required int endMs,
+    required int totalMs,
+  }) {
+    if (totalMs <= 0) {
+      return (startMs: 0, endMs: 0);
+    }
+    if (totalMs <= minClipMs) {
+      return (startMs: 0, endMs: totalMs);
+    }
+    var s = startMs.clamp(0, totalMs - minClipMs);
+    var e = endMs.clamp(minClipMs, totalMs);
+    if (e - s < minClipMs) {
+      if (s + minClipMs <= totalMs) {
+        e = s + minClipMs;
+      } else {
+        s = totalMs - minClipMs;
+        e = totalMs;
+      }
+    }
+    return (startMs: s, endMs: e);
+  }
+
+  static int clampCoverToTrim({
+    required int coverMs,
+    required int startMs,
+    required int endMs,
+  }) {
+    if (endMs <= startMs) return startMs;
+    return coverMs.clamp(startMs, endMs);
+  }
+
+  static bool isEffectivelyTrimmed({
+    required int startMs,
+    required int endMs,
+    required int totalMs,
+  }) {
+    if (totalMs <= 0) return false;
+    return startMs > 50 || endMs < totalMs - 50;
   }
 }
 
