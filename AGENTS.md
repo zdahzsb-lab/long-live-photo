@@ -11,11 +11,9 @@
 
 ## 2. Architecture Overview
 - **App Name**: `Unclip` (`lib/constants/app_branding.dart`, `AndroidManifest.xml`, `ios/Runner/Info.plist`).
-- **UI Layer**: `liquid_glass_widgets` (`^1.21.0`, iOS 27 preset), `lucide_icons_flutter`, `flutter_animate`, `StudioTokens` (`lib/theme/studio_tokens.dart`), `TactilePressable` (`lib/widgets/tactile_pressable.dart`), and `package:material_ui/material_ui.dart` (do **not** import deprecated `package:flutter/material.dart` or `package:flutter/cupertino.dart` on Flutter 3.50+).
-  - Keep `DefaultTextStyle(decoration: TextDecoration.none)` + `Material(type: MaterialType.transparency)` in `MaterialApp.builder` because `GlassScaffold` wraps `CupertinoPageScaffold` (which otherwise inherits `WidgetsApp`'s yellow double-underline fallback).
-  - Keep `extendBody: false` on `GlassScaffold` so `GlassAppBar` never overlaps `VideoStageCard` or blocks top-corner HUD touch targets (`>= 48dp`).
-  - Never nest refractive glass widgets (`GlassButton`, `GlassSegmentedControl`, `GlassIconButton`) inside a `glass`-mode `GlassContainer`.
-  - `GlassButton` uses non-nullable `onTap` + `enabled` bool; `GlassIconButton` uses `onPressed`.
+- **UI Layer**: Pure minimalist darkroom design system (`lib/theme/ui_tokens.dart`, `lib/ui/pressable.dart`, `lib/ui/buttons.dart`, `lib/ui/segmented_tabs.dart`, `lib/ui/result_sheet.dart`) built on `lucide_icons_flutter` and `package:material_ui/material_ui.dart` (do **not** import deprecated `package:flutter/material.dart` or `package:flutter/cupertino.dart` on Flutter 3.50+).
+  - Zero `BackdropFilter` / glass shader overhead: crisp Zinc monochrome palette (`#09090B` / `#121215` / `#FAFAFA`), `1px` translucent hairlines, and explicit `TextDecoration.none` across all typography.
+  - Every interactive control builds on `Pressable` (`Listener.onPointerDown` 0ms trigger + continuous `SpringSimulation` physics + `>= 44×44pt` opaque hit boxes).
 - **iOS Native Engine** (`ios/Runner/AppDelegate.swift`):
   - Uses `FlutterImplicitEngineDelegate` (`didInitializeImplicitFlutterEngine`) for `MethodChannel('com.longlive.long_live_photo/converter')` and `EventChannel('com.longlive.long_live_photo/progress')`.
   - Generates paired `JPG` (`MakerApple` key `"17"`) + QuickTime `MOV` (`com.apple.quicktime.content.identifier` + `mdta/com.apple.quicktime.still-image-time` timed metadata track), preserving scaled rotation translation via `scaledTransform`, and saves via `PHAssetCreationRequest`.

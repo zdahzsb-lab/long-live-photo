@@ -5,7 +5,6 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:video_player/video_player.dart';
@@ -13,84 +12,79 @@ import 'package:video_player/video_player.dart';
 import 'constants/app_branding.dart';
 import 'models/conversion_options.dart';
 import 'services/live_photo_channel.dart';
-import 'theme/studio_tokens.dart';
+import 'theme/ui_tokens.dart';
+import 'ui/buttons.dart';
+import 'ui/pressable.dart';
+import 'ui/result_sheet.dart';
+import 'ui/segmented_tabs.dart';
 import 'widgets/empty_studio_view.dart';
 import 'widgets/filmstrip_scrubber.dart';
-import 'widgets/studio_background.dart';
 import 'widgets/video_stage_card.dart';
 
-Future<void> main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  await LiquidGlassWidgets.initialize();
-
-  runApp(
-    LiquidGlassWidgets.wrap(
-      adaptiveQuality: true,
-      respectSystemAccessibility: true,
-      brightnessResolver: Theme.maybeBrightnessOf,
-      theme: const GlassThemeData.ios27(),
-      child: const LongLivePhotoApp(),
+  SystemChrome.setSystemUIOverlayStyle(
+    const SystemUiOverlayStyle(
+      statusBarColor: Color(0x00000000),
+      statusBarIconBrightness: Brightness.light,
+      statusBarBrightness: Brightness.dark,
+      systemNavigationBarColor: Ui.bg,
+      systemNavigationBarIconBrightness: Brightness.light,
     ),
   );
+  runApp(const LongLivePhotoApp());
 }
 
 class LongLivePhotoApp extends StatelessWidget {
-  const LongLivePhotoApp({super.key, this.gateway});
+  const LongLivePhotoApp({
+    super.key,
+    this.gateway,
+    this.debugInitialController,
+    this.debugInitialVideoPath,
+    this.debugInitialSizeBytes = 0,
+  });
 
   final LivePhotoConverterGateway? gateway;
+  final VideoPlayerController? debugInitialController;
+  final String? debugInitialVideoPath;
+  final int debugInitialSizeBytes;
 
   @override
   Widget build(BuildContext context) {
-    final baseDark = ThemeData(
-      brightness: Brightness.dark,
-      scaffoldBackgroundColor: StudioTokens.bgDeep,
-      colorScheme: ColorScheme.fromSeed(
-        seedColor: StudioTokens.accentPrimary,
-        brightness: Brightness.dark,
-      ),
-      useMaterial3: true,
-    );
-
     return MaterialApp(
       title: AppBranding.appName,
       debugShowCheckedModeBanner: false,
       themeMode: ThemeMode.dark,
-      darkTheme: baseDark.copyWith(
-        textTheme: baseDark.textTheme.apply(
-          bodyColor: StudioTokens.textPrimary,
-          displayColor: StudioTokens.textPrimary,
-          decoration: TextDecoration.none,
-          decorationColor: const Color(0x00000000),
-        ),
-      ),
-      // Guarantees Material + underline-free DefaultTextStyle above Navigator
-      // & Overlay so GlassScaffold, GlassDialog, and GlassToast never inherit
-      // WidgetsApp's yellow double-underline fallback text style.
+      darkTheme: Ui.theme(),
       builder: (BuildContext context, Widget? child) {
         return DefaultTextStyle(
-          style: const TextStyle(
-            fontSize: 14,
-            fontWeight: FontWeight.w400,
-            height: 1.45,
-            color: StudioTokens.textPrimary,
-            decoration: TextDecoration.none,
-            decorationColor: Color(0x00000000),
-          ),
-          child: Material(
-            type: MaterialType.transparency,
-            child: child ?? const SizedBox.shrink(),
-          ),
+          style: Ui.body.copyWith(color: Ui.textPrimary),
+          child: child ?? const SizedBox.shrink(),
         );
       },
-      home: ConverterHomePage(gateway: gateway ?? NativeLivePhotoChannel()),
+      home: ConverterHomePage(
+        gateway: gateway ?? NativeLivePhotoChannel(),
+        initialController: debugInitialController,
+        initialVideoPath: debugInitialVideoPath,
+        initialSizeBytes: debugInitialSizeBytes,
+      ),
     );
   }
 }
 
 class ConverterHomePage extends StatefulWidget {
-  const ConverterHomePage({super.key, required this.gateway});
+  const ConverterHomePage({
+    super.key,
+    required this.gateway,
+    this.initialController,
+    this.initialVideoPath,
+    this.initialSizeBytes = 0,
+  });
 
   final LivePhotoConverterGateway gateway;
+  final VideoPlayerController? initialController;
+  final String? initialVideoPath;
+  final int initialSizeBytes;
 
   @override
   State<ConverterHomePage> createState() => _ConverterHomePageState();
@@ -100,6 +94,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
   final ImagePicker _imagePicker = ImagePicker();
 
   VideoPlayerController? _videoController;
+  bool _ownsController = false;
   StreamSubscription<ConversionProgress>? _progressSub;
 
   String? _selectedVideoPath;
@@ -120,11 +115,21 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
   @override
   void initState() {
     super.initState();
+    final seeded = widget.initialController;
+    if (seeded != null && seeded.value.isInitialized) {
+      _videoController = seeded;
+      _ownsController = false;
+      _selectedVideoPath = widget.initialVideoPath ?? 'mock://seeded.mp4';
+      _sourceSizeBytes = widget.initialSizeBytes;
+      _videoDuration = seeded.value.duration;
+      _currentPosition = seeded.value.position;
+      _coverTimeMs = _videoDuration.inMilliseconds > 600 ? 500 : 0;
+      seeded.addListener(_onVideoTick);
+    }
+
     _progressSub = widget.gateway.progressStream.listen((ConversionProgress ev) {
       if (mounted && _isConverting) {
-        setState(() {
-          _progress = ev;
-        });
+        setState(() => _progress = ev);
       }
     });
   }
@@ -133,7 +138,9 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
   void dispose() {
     _progressSub?.cancel();
     _videoController?.removeListener(_onVideoTick);
-    _videoController?.dispose();
+    if (_ownsController) {
+      _videoController?.dispose();
+    }
     super.dispose();
   }
 
@@ -143,33 +150,27 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     final pos = ctrl.value.position;
     if ((pos - _currentPosition).inMilliseconds.abs() >= 80 ||
         !ctrl.value.isPlaying) {
-      setState(() {
-        _currentPosition = pos;
-      });
+      setState(() => _currentPosition = pos);
     }
   }
 
   String get _platformTag {
-    if (kIsWeb) return 'Web 预览环境';
-    if (Platform.isIOS) return 'iPhone · Apple Live Photo 直入相册';
-    if (Platform.isAndroid) return 'Android · 双标准动态照片直入相册';
+    if (kIsWeb) return 'Web 预览模式';
+    if (Platform.isIOS) return 'Apple Live Photo · 原生直入系统照片';
+    if (Platform.isAndroid) return 'Android 动态照片 · 双标准兼容各大品牌相册';
     return 'Studio 预览模式';
   }
 
-  void _showErrorToast(String msg) {
+  void _showMessage(String msg) {
     if (!mounted) return;
     HapticFeedback.heavyImpact();
-    GlassToast.show(
-      context,
-      message: msg,
-      type: GlassToastType.error,
-      position: GlassToastPosition.top,
-    );
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(msg)));
   }
 
   Future<void> _pickFromGallery() async {
     if (_isConverting) return;
-    HapticFeedback.selectionClick();
     try {
       final XFile? picked = await _imagePicker.pickVideo(
         source: ImageSource.gallery,
@@ -177,15 +178,14 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
       if (picked == null) return;
       await _loadVideoFile(picked.path);
     } on PlatformException catch (e) {
-      _showErrorToast('读取相册失败：${e.message ?? e.code}');
+      _showMessage('读取相册失败：${e.message ?? e.code}');
     } catch (e) {
-      _showErrorToast('读取相册失败：$e');
+      _showMessage('读取相册失败：$e');
     }
   }
 
   Future<void> _pickFromFiles() async {
     if (_isConverting) return;
-    HapticFeedback.selectionClick();
     try {
       final List<PlatformFile> files = await FilePicker.pickFiles(
         type: FileType.video,
@@ -193,9 +193,60 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
       if (files.isEmpty || files.first.path == null) return;
       await _loadVideoFile(files.first.path!);
     } on PlatformException catch (e) {
-      _showErrorToast('导入视频失败：${e.message ?? e.code}');
+      _showMessage('导入视频失败：${e.message ?? e.code}');
     } catch (e) {
-      _showErrorToast('导入视频失败：$e');
+      _showMessage('导入视频失败：$e');
+    }
+  }
+
+  Future<void> _openSourceSheet() async {
+    if (_isConverting) return;
+    final String? choice = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: Ui.surface,
+      barrierColor: const Color(0xA6000000),
+      builder: (BuildContext sheetContext) {
+        return SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(Ui.s5, Ui.s1, Ui.s5, Ui.s5),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                const Padding(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: Ui.s1,
+                    vertical: Ui.s2,
+                  ),
+                  child: Text('更换视频素材', style: Ui.title),
+                ),
+                const SizedBox(height: Ui.s2),
+                SecondaryButton(
+                  key: const Key('sheet_pick_gallery'),
+                  label: '从系统相册选择',
+                  icon: LucideIcons.images,
+                  onTap: () => Navigator.of(sheetContext).pop('gallery'),
+                ),
+                const SizedBox(height: Ui.s2 + 2),
+                SecondaryButton(
+                  key: const Key('sheet_pick_files'),
+                  label: '从文件管理器导入',
+                  icon: LucideIcons.folderOpen,
+                  onTap: () => Navigator.of(sheetContext).pop('files'),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+
+    if (!mounted || choice == null) return;
+    if (choice == 'gallery') {
+      await _pickFromGallery();
+    } else if (choice == 'files') {
+      await _pickFromFiles();
     }
   }
 
@@ -206,6 +257,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     });
 
     final oldController = _videoController;
+    final oldOwned = _ownsController;
     oldController?.removeListener(_onVideoTick);
 
     try {
@@ -229,6 +281,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
 
       setState(() {
         _videoController = ctrl;
+        _ownsController = true;
         _selectedVideoPath = path;
         _sourceSizeBytes = size;
         _videoDuration = ctrl.value.duration;
@@ -242,12 +295,15 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
       if (mounted) {
         setState(() {
           _videoController = null;
+          _ownsController = false;
           _isLoadingVideo = false;
         });
-        _showErrorToast('无法解析该视频：$e');
+        _showMessage('无法解析该视频：$e');
       }
     } finally {
-      await oldController?.dispose();
+      if (oldOwned) {
+        await oldController?.dispose();
+      }
     }
   }
 
@@ -257,9 +313,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
       count: 8,
     );
     if (mounted && _selectedVideoPath == path) {
-      setState(() {
-        _thumbnails = frames;
-      });
+      setState(() => _thumbnails = frames);
     }
   }
 
@@ -270,6 +324,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     final clamped = targetMs.clamp(0, maxMs > 0 ? maxMs : 0);
     setState(() {
       _coverTimeMs = clamped;
+      _currentPosition = Duration(milliseconds: clamped);
     });
     if (ctrl.value.isPlaying) {
       await ctrl.pause();
@@ -280,7 +335,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
   Future<void> _togglePlay() async {
     final ctrl = _videoController;
     if (ctrl == null || _isConverting) return;
-    HapticFeedback.selectionClick();
+    playHaptic(Haptic.selection);
     if (ctrl.value.isPlaying) {
       await ctrl.pause();
     } else {
@@ -301,7 +356,6 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     final path = _selectedVideoPath;
     if (path == null || _isConverting) return;
 
-    HapticFeedback.mediumImpact();
     final ctrl = _videoController;
     if (ctrl != null && ctrl.value.isPlaying) {
       await ctrl.pause();
@@ -311,8 +365,8 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
       _isConverting = true;
       _progress = const ConversionProgress(
         stage: 'preparing',
-        progress: 0.03,
-        message: '正在初始化实况合成管线...',
+        progress: 0.04,
+        message: '正在准备实况合成...',
       );
     });
 
@@ -325,27 +379,16 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
       );
 
       if (!mounted) return;
-      HapticFeedback.mediumImpact();
+      playHaptic(Haptic.medium);
       setState(() {
         _isConverting = false;
         _progress = null;
       });
 
-      final seconds = (result.elapsedMs / 1000).toStringAsFixed(1);
-      await GlassDialog.show(
+      await showConversionResultSheet(
         context: context,
-        title: '已存入系统相册',
-        message: '总时长 ${formatPreciseDuration(_videoDuration)} 完整未截断\n'
-            '成品体积 ${formatFileSize(result.outputSizeBytes)} · 耗时 $seconds 秒\n\n'
-            '打开手机“照片/相册”按住画面即可完整回放。',
-        actions: <GlassDialogAction>[
-          GlassDialogAction(
-            label: '完成',
-            isPrimary: true,
-            tintColor: StudioTokens.accentPrimary,
-            onPressed: () => Navigator.of(context).pop(),
-          ),
-        ],
+        duration: _videoDuration,
+        result: result,
       );
     } on PlatformException catch (e) {
       if (!mounted) return;
@@ -353,14 +396,14 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
         _isConverting = false;
         _progress = null;
       });
-      _showErrorToast(e.message ?? '合成失败（${e.code}）');
+      _showMessage(e.message ?? '合成失败（${e.code}）');
     } catch (e) {
       if (!mounted) return;
       setState(() {
         _isConverting = false;
         _progress = null;
       });
-      _showErrorToast('合成出错：$e');
+      _showMessage('合成出错：$e');
     }
   }
 
@@ -368,157 +411,123 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
   Widget build(BuildContext context) {
     final ctrl = _videoController;
     final hasVideo = ctrl != null && ctrl.value.isInitialized;
-    final reduceMotion = MediaQuery.disableAnimationsOf(context);
-    final scaledBodyPx = MediaQuery.textScalerOf(context).scale(14.0);
+    final scaledPx = MediaQuery.textScalerOf(context).scale(14.0);
 
-    return GlassScaffold(
-      background: const StudioBackground(),
-      statusBarStyle: GlassStatusBarStyle.light,
-      // Critical fix: keep body strictly below AppBar so GlassAppBar never
-      // overlaps VideoStageCard or intercepts top-left audio pill taps!
-      extendBody: false,
-      edgeFade: false,
-      appBar: GlassAppBar(
-        surfaceStyle: GlassAppBarSurfaceStyle.transparent,
-        title: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            ExcludeSemantics(
-              child: Container(
-                width: 22,
-                height: 22,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  gradient: const LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                    colors: <Color>[
-                      StudioTokens.accentCyan,
-                      StudioTokens.accentPrimary,
-                    ],
+    return Scaffold(
+      backgroundColor: Ui.bg,
+      body: SafeArea(
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 560),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                // Minimalist 52pt Top Header — strictly separated from stage
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(Ui.s5, Ui.s1, Ui.s4, Ui.s1),
+                  child: SizedBox(
+                    height: 44,
+                    child: Row(
+                      children: <Widget>[
+                        const Text(AppBranding.appName, style: Ui.wordmark),
+                        const SizedBox(width: Ui.s2),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 7,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Ui.surface,
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(color: Ui.hairline),
+                          ),
+                          child: Text(
+                            'LIVE',
+                            style: Ui.mono.copyWith(
+                              fontSize: 10.5,
+                              letterSpacing: 0.6,
+                              color: Ui.textSecondary,
+                            ),
+                          ),
+                        ),
+                        const Spacer(),
+                        if (hasVideo)
+                          PillAction(
+                            key: const Key('replace_video_button'),
+                            label: '更换',
+                            semanticLabel: '更换视频素材',
+                            icon: LucideIcons.arrowLeftRight,
+                            enabled: !_isConverting,
+                            onTap: _openSourceSheet,
+                          ),
+                      ],
+                    ),
                   ),
-                  border: Border.all(
-                    color: StudioTokens.borderStrong,
-                    width: 0.8,
+                ),
+
+                // Main Studio Body
+                Expanded(
+                  child: LayoutBuilder(
+                    builder: (BuildContext context, BoxConstraints constraints) {
+                      final horizontalPad =
+                          constraints.maxWidth >= 500 ? 24.0 : 18.0;
+                      final isCompact =
+                          constraints.maxHeight < 520 || scaledPx > 18.0;
+
+                      final content = AnimatedSwitcher(
+                        duration: Ui.motion(context, Ui.base),
+                        switchInCurve: Ui.easeOut,
+                        switchOutCurve: Ui.easeIn,
+                        child: _buildActiveView(
+                          ctrl: ctrl,
+                          hasVideo: hasVideo,
+                          useFlexibleStage: !isCompact,
+                        ),
+                      );
+
+                      final padded = Padding(
+                        padding: EdgeInsets.fromLTRB(
+                          horizontalPad,
+                          Ui.s1,
+                          horizontalPad,
+                          Ui.s4,
+                        ),
+                        child: content,
+                      );
+
+                      if (isCompact) {
+                        return SingleChildScrollView(child: padded);
+                      }
+                      return padded;
+                    },
                   ),
-                ),
-                child: const Icon(
-                  LucideIcons.aperture,
-                  size: 13,
-                  color: Colors.white,
-                ),
-              ),
-            ),
-            const SizedBox(width: 8),
-            const Text(
-              AppBranding.appName,
-              style: TextStyle(
-                fontSize: 17,
-                fontWeight: FontWeight.w700,
-                color: StudioTokens.textPrimary,
-                letterSpacing: -0.2,
-                decoration: TextDecoration.none,
-              ),
-            ),
-          ],
-        ),
-        actions: <Widget>[
-          if (hasVideo && !_isConverting)
-            GlassPullDownButton(
-              icon: const Icon(
-                LucideIcons.folderPlus,
-                size: 18,
-                color: StudioTokens.textPrimary,
-              ),
-              semanticLabel: '更换视频素材',
-              items: <Widget>[
-                GlassMenuItem(
-                  title: '从相册重选视频',
-                  icon: const Icon(LucideIcons.images, size: 18),
-                  onTap: _pickFromGallery,
-                ),
-                GlassMenuItem(
-                  title: '从文件管理器导入',
-                  icon: const Icon(LucideIcons.folderOpen, size: 18),
-                  onTap: _pickFromFiles,
                 ),
               ],
             ),
-        ],
-      ),
-      body: SafeArea(
-        top: false,
-        child: LayoutBuilder(
-          builder: (BuildContext context, BoxConstraints constraints) {
-            final horizontalPad = constraints.maxWidth >= 600 ? 28.0 : 16.0;
-            final isCompactViewport =
-                constraints.maxHeight < 560 || scaledBodyPx > 18.0;
-
-            final studioChild = AnimatedSwitcher(
-              duration: reduceMotion
-                  ? Duration.zero
-                  : StudioTokens.stateDuration,
-              switchInCurve: StudioTokens.curveOutExpo,
-              switchOutCurve: Curves.easeInCubic,
-              child: _buildActiveStateView(
-                ctrl: ctrl,
-                hasVideo: hasVideo,
-                useFlexibleStage: !isCompactViewport,
-                reduceMotion: reduceMotion,
-              ),
-            );
-
-            final padded = Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 600),
-                child: Padding(
-                  padding: EdgeInsets.fromLTRB(
-                    horizontalPad,
-                    8,
-                    horizontalPad,
-                    16,
-                  ),
-                  child: studioChild,
-                ),
-              ),
-            );
-
-            if (isCompactViewport) {
-              return SingleChildScrollView(child: padded);
-            }
-            return padded;
-          },
+          ),
         ),
       ),
     );
   }
 
-  Widget _buildActiveStateView({
+  Widget _buildActiveView({
     required VideoPlayerController? ctrl,
     required bool hasVideo,
     required bool useFlexibleStage,
-    required bool reduceMotion,
   }) {
     if (_isLoadingVideo) {
       return Center(
-        key: const ValueKey<String>('studio_loading'),
+        key: const ValueKey<String>('state_loading'),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
-            GlassProgressIndicator.circular(
-              size: 38,
-              useOwnLayer: true,
-              semanticLabel: '正在解析视频',
+            const SizedBox(
+              width: 24,
+              height: 24,
+              child: CircularProgressIndicator(strokeWidth: 2.2),
             ),
-            const SizedBox(height: 14),
-            const Text(
-              '正在解析视频帧与音轨...',
-              style: TextStyle(
-                fontSize: 13.5,
-                color: StudioTokens.textSecondary,
-                decoration: TextDecoration.none,
-              ),
-            ),
+            const SizedBox(height: Ui.s3),
+            Text('正在读取视频...', style: Ui.body),
           ],
         ),
       );
@@ -526,7 +535,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
 
     if (!hasVideo || ctrl == null) {
       return KeyedSubtree(
-        key: const ValueKey<String>('studio_empty'),
+        key: const ValueKey<String>('state_empty'),
         child: EmptyStudioView(
           platformTag: _platformTag,
           isBusy: _isConverting,
@@ -542,7 +551,12 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
       keepAudio: _keepAudio,
     );
 
-    final stageWidget = VideoStageCard(
+    final pct = ((_progress?.progress ?? 0.0) * 100).round().clamp(0, 100);
+    final busyLabel = _progress != null
+        ? '${_progress!.message}  $pct%'
+        : '正在合成实况照片...';
+
+    final stage = VideoStageCard(
       controller: ctrl,
       currentPosition: _currentPosition,
       totalDuration: _videoDuration,
@@ -554,17 +568,17 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     );
 
     return Column(
-      key: const ValueKey<String>('studio_editor'),
+      key: const ValueKey<String>('state_editor'),
       mainAxisSize: useFlexibleStage ? MainAxisSize.max : MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
         if (useFlexibleStage)
-          Expanded(child: stageWidget)
+          Expanded(child: stage)
         else
-          SizedBox(height: 260, child: stageWidget),
-        const SizedBox(height: 12),
+          SizedBox(height: 260, child: stage),
+        const SizedBox(height: Ui.s3),
 
-        // 1. Cover Filmstrip Console
+        // 1. Filmstrip Cover Picker
         FilmstripScrubber(
           thumbnails: _thumbnails,
           coverTimeMs: _coverTimeMs,
@@ -574,185 +588,60 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
           onUseCurrentFrame: () =>
               _seekCoverTo(_currentPosition.inMilliseconds),
         ),
-        const SizedBox(height: 12),
+        const SizedBox(height: Ui.s3 + 2),
 
-        // 2. Liquid Glass Quality Segmented Control (directly on platter per Rule 2)
-        GlassSegmentedControl(
-          height: 44,
-          borderRadius: 22,
-          useOwnLayer: true,
+        // 2. Minimalist Sliding Quality Tabs
+        SegmentedTabs<QualityPreset>(
+          key: const Key('quality_segmented_tabs'),
+          items: QualityPreset.values,
           selectedIndex: _quality.index,
-          onSegmentSelected: (int index) {
-            if (_isConverting) return;
-            HapticFeedback.selectionClick();
-            setState(() {
-              _quality = QualityPreset.values[index];
-            });
+          enabled: !_isConverting,
+          labelBuilder: (QualityPreset p) => p.segmentLabel,
+          onChanged: (int index) {
+            setState(() => _quality = QualityPreset.values[index]);
           },
-          segments: <GlassSegment>[
-            for (final preset in QualityPreset.values)
-              GlassSegment(label: preset.segmentLabel),
-          ],
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: Ui.s2),
 
-        // 3. Animated Quality Description + Estimated Output Size Readout
+        // 3. Preset Subtitle + Estimated Output Size
         AnimatedSwitcher(
-          duration: reduceMotion ? Duration.zero : StudioTokens.microDuration,
-          switchInCurve: StudioTokens.curveOutExpo,
+          duration: Ui.motion(context, Ui.fast),
+          switchInCurve: Ui.easeOut,
           child: Row(
             key: ValueKey<String>('${_quality.wireValue}_$_keepAudio'),
-            mainAxisAlignment: MainAxisAlignment.center,
             children: <Widget>[
-              Flexible(
+              Expanded(
                 child: Text(
                   _quality.subtitle,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 12,
-                    color: StudioTokens.textMuted,
-                    decoration: TextDecoration.none,
-                  ),
+                  style: Ui.caption,
                 ),
               ),
               if (estimatedBytes > 0) ...<Widget>[
-                const SizedBox(width: 8),
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 8,
-                    vertical: 2,
-                  ),
-                  decoration: BoxDecoration(
-                    color: StudioTokens.surfaceSubtle,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(
-                      color: StudioTokens.borderSubtle,
-                      width: 0.8,
-                    ),
-                  ),
-                  child: Text(
-                    '预计 ${formatFileSize(estimatedBytes)}',
-                    style: const TextStyle(
-                      fontSize: 11,
-                      fontFeatures: <FontFeature>[
-                        FontFeature.tabularFigures(),
-                      ],
-                      fontWeight: FontWeight.w600,
-                      color: StudioTokens.accentIce,
-                      decoration: TextDecoration.none,
-                    ),
+                const SizedBox(width: Ui.s2),
+                Text(
+                  '约 ${formatFileSize(estimatedBytes)}',
+                  style: Ui.mono.copyWith(
+                    fontSize: 12,
+                    color: Ui.textSecondary,
                   ),
                 ),
               ],
             ],
           ),
         ),
-        const SizedBox(height: 12),
+        const SizedBox(height: Ui.s4),
 
-        // 4. Smooth Progress Bar During Conversion
-        AnimatedSize(
-          duration: reduceMotion ? Duration.zero : StudioTokens.microDuration,
-          curve: StudioTokens.curveOutExpo,
-          child: (_isConverting && _progress != null)
-              ? Padding(
-                  padding: const EdgeInsets.only(bottom: 10),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: <Widget>[
-                      GlassProgressIndicator.linear(
-                        value: _progress!.progress > 0
-                            ? _progress!.progress
-                            : null,
-                        height: 6,
-                        useOwnLayer: true,
-                      ),
-                      const SizedBox(height: 6),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: <Widget>[
-                          Expanded(
-                            child: Text(
-                              _progress!.message,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                fontSize: 12,
-                                color: StudioTokens.textSecondary,
-                                decoration: TextDecoration.none,
-                              ),
-                            ),
-                          ),
-                          Text(
-                            '${(_progress!.progress * 100).round()}%',
-                            style: const TextStyle(
-                              fontSize: 12,
-                              fontFeatures: <FontFeature>[
-                                FontFeature.tabularFigures(),
-                              ],
-                              fontWeight: FontWeight.w700,
-                              color: StudioTokens.accentIce,
-                              decoration: TextDecoration.none,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                )
-              : const SizedBox.shrink(),
-        ),
-
-        // 5. Primary Liquid Glass Action Pill with Cinema Cobalt Glow
-        DecoratedBox(
-          decoration: BoxDecoration(
-            borderRadius: const BorderRadius.all(Radius.circular(28)),
-            boxShadow: _isConverting
-                ? const <BoxShadow>[]
-                : const <BoxShadow>[
-                    BoxShadow(
-                      color: StudioTokens.accentGlow,
-                      blurRadius: 24,
-                      offset: Offset(0, 8),
-                    ),
-                  ],
-          ),
-          child: GlassButton.custom(
-            key: const Key('convert_save_button'),
-            height: 54,
-            enabled: !_isConverting,
-            useOwnLayer: true,
-            style: GlassButtonStyle.prominent,
-            tintColor: StudioTokens.accentPrimary,
-            shape: const LiquidRoundedSuperellipse(borderRadius: 27),
-            onTap: _startConversion,
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: <Widget>[
-                ExcludeSemantics(
-                  child: Icon(
-                    _isConverting ? LucideIcons.loader : LucideIcons.sparkles,
-                    size: 18,
-                    color: Colors.white,
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Flexible(
-                  child: Text(
-                    _isConverting ? '正在合成实况照片...' : '生成实况并存入系统相册',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontSize: 15.5,
-                      fontWeight: FontWeight.w700,
-                      color: Colors.white,
-                      decoration: TextDecoration.none,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
+        // 4. Primary Action Button (morphs into inline progress sweep when busy)
+        PrimaryButton(
+          key: const Key('convert_save_button'),
+          label: '生成实况并存入相册',
+          icon: LucideIcons.arrowDownToLine,
+          enabled: !_isConverting,
+          progress: _isConverting ? (_progress?.progress ?? 0.04) : null,
+          progressLabel: busyLabel,
+          onTap: _startConversion,
         ),
       ],
     );
