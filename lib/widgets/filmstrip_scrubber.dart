@@ -167,9 +167,13 @@ class _FilmstripScrubberState extends State<FilmstripScrubber> {
         : Row(
             mainAxisSize: MainAxisSize.min,
             children: <Widget>[
-              Text(
-                '封面',
-                style: Ui.caption.copyWith(color: Ui.textSecondary),
+              Flexible(
+                child: Text(
+                  '封面',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Ui.caption.copyWith(color: Ui.textSecondary),
+                ),
               ),
               const SizedBox(width: 6),
               Flexible(
@@ -215,7 +219,7 @@ class _FilmstripScrubberState extends State<FilmstripScrubber> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
         // Header row: adapts cleanly on 375px + large Dynamic Type
-        if (scaledPx > 18.0)
+        if (scaledPx > 15.5)
           Wrap(
             alignment: WrapAlignment.spaceBetween,
             crossAxisAlignment: WrapCrossAlignment.center,
@@ -257,7 +261,7 @@ class _FilmstripScrubberState extends State<FilmstripScrubber> {
                 final loupeMin = trimContentLeft;
                 final loupeMax =
                     (trimContentRight - loupeWidth).clamp(loupeMin, trackWidth);
-                final rawLoupeCenter = trimContentLeft + coverRatio * usableWidth;
+                final rawLoupeCenter = _handleWidth + coverRatio * usableWidth;
                 final loupeLeft =
                     (rawLoupeCenter - loupeWidth / 2).clamp(loupeMin, loupeMax);
 
@@ -415,6 +419,7 @@ class _FilmstripScrubberState extends State<FilmstripScrubber> {
                                 ? 1.07
                                 : 1.0,
                             child: Container(
+                              key: const Key('filmstrip_cover_loupe'),
                               decoration: BoxDecoration(
                                 color: const Color(0x1FFFFFFF),
                                 borderRadius: BorderRadius.circular(6),

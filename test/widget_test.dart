@@ -12,14 +12,28 @@ import 'package:long_live_photo/services/conversion_history_store.dart';
 import 'package:long_live_photo/services/live_photo_channel.dart';
 import 'package:long_live_photo/ui/buttons.dart';
 import 'package:long_live_photo/utils/motion_photo_spec.dart';
+import 'package:long_live_photo/widgets/filmstrip_scrubber.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:video_player/video_player.dart';
 
 class _ControllableGateway implements LivePhotoConverterGateway {
   final StreamController<ConversionProgress> progressController =
       StreamController<ConversionProgress>.broadcast();
+  final StreamController<List<SharedMediaItem>> sharedMediaController =
+      StreamController<List<SharedMediaItem>>.broadcast();
 
   Completer<ConversionResult>? pendingConversion;
+  Completer<ConversionResult>? pendingExport;
+  bool autoCompleteConversions = false;
+  final Set<String> failVideoPaths = <String>{};
+  final List<String> convertedVideoPaths = <String>[];
+
+  List<SharedMediaItem> initialSharedMedia = const <SharedMediaItem>[];
+  UnpackedLivePhoto? pickUnpackResult;
+  UnpackedLivePhoto? fileUnpackResult;
+  int openGalleryCalls = 0;
+  String? lastOpenedGalleryTarget;
+
   String? lastVideoPath;
   int? lastCoverTimeMs;
   QualityPreset? lastQuality;
@@ -29,10 +43,21 @@ class _ControllableGateway implements LivePhotoConverterGateway {
   int? lastTrimEndMs;
   bool? lastPreserveMetadata;
   double? lastPlaybackSpeed;
+
+  StandaloneExportMode? lastExportMode;
+  QualityPreset? lastExportQuality;
+  bool? lastExportKeepAudio;
+  double? lastExportPlaybackSpeed;
+  int? lastExportCoverTimeMs;
+
   int cancelCalls = 0;
 
   @override
   Stream<ConversionProgress> get progressStream => progressController.stream;
+
+  @override
+  Stream<List<SharedMediaItem>> get sharedMediaStream =>
+      sharedMediaController.stream;
 
   @override
   Future<ConversionResult> convertAndSave({
@@ -45,7 +70,8 @@ class _ControllableGateway implements LivePhotoConverterGateway {
     int? trimEndMs,
     bool preserveMetadata = true,
     double playbackSpeed = 1.0,
-  }) {
+  }) async {
+    convertedVideoPaths.add(videoPath);
     lastVideoPath = videoPath;
     lastCoverTimeMs = coverTimeMs;
     lastQuality = quality;
@@ -55,6 +81,19 @@ class _ControllableGateway implements LivePhotoConverterGateway {
     lastTrimEndMs = trimEndMs;
     lastPreserveMetadata = preserveMetadata;
     lastPlaybackSpeed = playbackSpeed;
+
+    if (failVideoPaths.contains(videoPath)) {
+      throw PlatformException(code: 'CONVERT_FAILED', message: '模拟合成失败');
+    }
+    if (autoCompleteConversions) {
+      return ConversionResult(
+        savedTarget: 'content://media/batch/${convertedVideoPaths.length}',
+        outputSizeBytes: 6 * 1024 * 1024,
+        elapsedMs: 900,
+        platformFormat: 'Motion Photo',
+      );
+    }
+
     final completer = Completer<ConversionResult>();
     pendingConversion = completer;
     return completer.future;
@@ -69,6 +108,12 @@ class _ControllableGateway implements LivePhotoConverterGateway {
         PlatformException(code: 'CANCELLED', message: '已取消实况合成'),
       );
     }
+    final pendingExp = pendingExport;
+    if (pendingExp != null && !pendingExp.isCompleted) {
+      pendingExp.completeError(
+        PlatformException(code: 'CANCELLED', message: '已取消导出'),
+      );
+    }
   }
 
   @override
@@ -79,8 +124,77 @@ class _ControllableGateway implements LivePhotoConverterGateway {
     return const <Uint8List>[];
   }
 
+  @override
+  Future<List<SharedMediaItem>> consumeInitialSharedMedia() async {
+    final items = initialSharedMedia;
+    initialSharedMedia = const <SharedMediaItem>[];
+    return items;
+  }
+
+  @override
+  Future<bool> openSystemGallery({String? savedTarget}) async {
+    openGalleryCalls++;
+    lastOpenedGalleryTarget = savedTarget;
+    return true;
+  }
+
+  @override
+  Future<UnpackedLivePhoto?> pickAndUnpackLivePhoto() async {
+    return pickUnpackResult;
+  }
+
+  @override
+  Future<UnpackedLivePhoto> unpackLivePhotoFile({
+    required String filePath,
+  }) async {
+    final res = fileUnpackResult;
+    if (res == null) {
+      throw PlatformException(
+        code: 'NOT_LIVE_PHOTO',
+        message: '所选图片不包含实况视频轨道',
+      );
+    }
+    return res;
+  }
+
+  @override
+  Future<ConversionResult> exportStandaloneMedia({
+    required StandaloneExportMode mode,
+    required String videoPath,
+    required int coverTimeMs,
+    QualityPreset quality = QualityPreset.passthrough,
+    bool keepAudio = true,
+    String? customCoverPath,
+    int? trimStartMs,
+    int? trimEndMs,
+    bool preserveMetadata = true,
+    double playbackSpeed = 1.0,
+  }) {
+    lastExportMode = mode;
+    lastExportQuality = quality;
+    lastExportKeepAudio = keepAudio;
+    lastExportPlaybackSpeed = playbackSpeed;
+    lastExportCoverTimeMs = coverTimeMs;
+    if (autoCompleteConversions) {
+      return Future<ConversionResult>.value(
+        ConversionResult(
+          savedTarget: 'content://media/export/${mode.wireValue}',
+          outputSizeBytes: mode == StandaloneExportMode.cover
+              ? 420 * 1024
+              : 7 * 1024 * 1024,
+          elapsedMs: 650,
+          platformFormat: mode == StandaloneExportMode.cover ? 'JPEG' : 'MP4',
+        ),
+      );
+    }
+    final completer = Completer<ConversionResult>();
+    pendingExport = completer;
+    return completer.future;
+  }
+
   void dispose() {
     progressController.close();
+    sharedMediaController.close();
   }
 }
 
@@ -823,6 +937,412 @@ void main() {
       await tester.tap(find.byKey(const Key('history_clear_all_button')));
       await tester.pumpAndSettle();
       expect(find.text('暂无合成记录'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'FilmstripScrubber cover loupe aligns at left trim start without double-offset',
+    (WidgetTester tester) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Center(
+              child: SizedBox(
+                width: 340,
+                child: FilmstripScrubber(
+                  thumbnails: const <Uint8List>[],
+                  coverTimeMs: 3000,
+                  totalDurationMs: 10000,
+                  trimStartMs: 3000,
+                  trimEndMs: 10000,
+                  hasCustomCover: false,
+                  enabled: true,
+                  onScrubToMs: (_) {},
+                  onUseCurrentFrame: () {},
+                  onTrimChanged: (_, _) {},
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final trackRect =
+          tester.getRect(find.byKey(const Key('filmstrip_track_gesture')));
+      final loupeRect =
+          tester.getRect(find.byKey(const Key('filmstrip_cover_loupe')));
+      const handleWidth = 14.0;
+      final usableWidth = trackRect.width - handleWidth * 2;
+      final expectedLeft = trackRect.left + handleWidth + 0.30 * usableWidth;
+
+      expect(loupeRect.left, closeTo(expectedLeft, 1.5));
+    },
+  );
+
+  test(
+    'MotionPhotoSpec.extractMotionPhoto unpacks dual-standard, legacy MicroVideo, Samsung marker, and returns null for static JPEG',
+    () {
+      final minimalJpeg = Uint8List.fromList(<int>[
+        0xFF, 0xD8,
+        0xFF, 0xE0, 0x00, 0x06, 0x4A, 0x46, 0x49, 0x46,
+        0xFF, 0xDA, 0x00, 0x04, 0x00, 0x01,
+        0x7F,
+        0xFF, 0xD9,
+      ]);
+      expect(MotionPhotoSpec.extractMotionPhoto(minimalJpeg), isNull);
+
+      final fakeMp4 = Uint8List.fromList(<int>[
+        0x00, 0x00, 0x00, 0x18,
+        ...ascii.encode('ftypisom'),
+        0x00, 0x00, 0x02, 0x00,
+        ...ascii.encode('isomiso2mp41'),
+      ]);
+
+      final assembled = MotionPhotoSpec.assembleMotionPhoto(
+        jpegBytes: minimalJpeg,
+        mp4Bytes: fakeMp4,
+        presentationTimestampUs: 1750000,
+      );
+      final unpacked = MotionPhotoSpec.extractMotionPhoto(assembled);
+      expect(unpacked, isNotNull);
+      expect(unpacked!.mp4Bytes, equals(fakeMp4));
+      expect(unpacked.presentationTimestampUs, 1750000);
+      expect(
+        latin1.decode(unpacked.jpegBytes),
+        isNot(contains('GCamera:MotionPhoto')),
+      );
+
+      // Samsung MotionPhoto_Data prefix after JPEG EOI (without XMP)
+      final samsungMotion = Uint8List.fromList(<int>[
+        ...minimalJpeg,
+        ...ascii.encode('MotionPhoto_Data'),
+        ...fakeMp4,
+      ]);
+      final unpackedSamsung = MotionPhotoSpec.extractMotionPhoto(samsungMotion);
+      expect(unpackedSamsung, isNotNull);
+      expect(unpackedSamsung!.mp4Bytes, equals(fakeMp4));
+    },
+  );
+
+  test(
+    'FileConversionHistoryStore copies customCoverSourcePath into managed thumbs and survives source temp removal',
+    () async {
+      final tempRoot =
+          Directory.systemTemp.createTempSync('unclip_custom_cover_test_');
+      addTearDown(() {
+        if (tempRoot.existsSync()) {
+          tempRoot.deleteSync(recursive: true);
+        }
+      });
+
+      final externalCover = File(
+        '${tempRoot.path}${Platform.pathSeparator}picked_cover.png',
+      );
+      await externalCover.writeAsBytes(<int>[0x89, 0x50, 0x4E, 0x47]);
+
+      final store = FileConversionHistoryStore(
+        baseDirProvider: () async => tempRoot,
+      );
+      final updated = await store.add(
+        ConversionHistoryEntry(
+          id: 'custom_1',
+          createdAtMs: 1700000000000,
+          sourceVideoPath: '/tmp/clip.mp4',
+          savedTarget: 'content://media/1',
+          platformFormat: 'Motion Photo',
+          sourceDurationMs: 10000,
+          outputDurationMs: 10000,
+          outputSizeBytes: 2 * 1024 * 1024,
+          elapsedMs: 1000,
+          qualityWireValue: '1080p',
+          playbackSpeed: 1.0,
+          keepAudio: true,
+          preserveMetadata: true,
+          wasTrimmed: false,
+          coverTimeMs: 500,
+          customCoverPath: externalCover.path,
+        ),
+        customCoverSourcePath: externalCover.path,
+      );
+
+      // Delete original temp cover; copied managed thumbnail must survive
+      await externalCover.delete();
+      expect(updated.single.thumbnailPath, isNotNull);
+      expect(updated.single.thumbnailPath!, endsWith('.png'));
+      expect(File(updated.single.thumbnailPath!).existsSync(), isTrue);
+
+      final copiedPath = updated.single.thumbnailPath!;
+      await store.removeById('custom_1');
+      expect(File(copiedPath).existsSync(), isFalse);
+    },
+  );
+
+  testWidgets(
+    'History entry with deleted source video applies parameters and surviving cover onto active video',
+    (WidgetTester tester) async {
+      final gateway = _ControllableGateway();
+      final fakeCtrl = _FakeVideoController();
+      final entry = ConversionHistoryEntry(
+        id: 'deleted_src_1',
+        createdAtMs: DateTime.now().millisecondsSinceEpoch,
+        sourceVideoPath: 'mock://removed_video.mp4',
+        savedTarget: 'mock://saved/1',
+        platformFormat: 'Motion Photo',
+        sourceDurationMs: 15000,
+        outputDurationMs: 7500,
+        outputSizeBytes: 4 * 1024 * 1024,
+        elapsedMs: 1200,
+        qualityWireValue: '720p',
+        playbackSpeed: 2.0,
+        keepAudio: false,
+        preserveMetadata: false,
+        wasTrimmed: false,
+        coverTimeMs: 500,
+        customCoverPath: 'mock://gone_temp_cover.jpg',
+        thumbnailPath: 'mock://managed_thumb_cover.jpg',
+      );
+      final store = InMemoryConversionHistoryStore(<ConversionHistoryEntry>[
+        entry,
+      ]);
+
+      addTearDown(() {
+        gateway.dispose();
+        fakeCtrl.dispose();
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      tester.view.physicalSize = const Size(390 * 3, 844 * 3);
+      tester.view.devicePixelRatio = 3.0;
+
+      await tester.pumpWidget(
+        LongLivePhotoApp(
+          gateway: gateway,
+          historyStore: store,
+          debugInitialController: fakeCtrl,
+          debugInitialVideoPath: 'mock://active_video.mp4',
+          debugInitialSizeBytes: 20 * 1024 * 1024,
+          debugFileExistsChecker: (String path) async =>
+              path == 'mock://active_video.mp4' ||
+              path == 'mock://managed_thumb_cover.jpg',
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('history_drawer_button')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(Key('history_entry_${entry.id}')));
+      await tester.pumpAndSettle();
+
+      expect(fakeCtrl.lastPlaybackSpeed, 2.0);
+      expect(fakeCtrl.lastVolume, 0.0);
+      expect(find.text('已换封面'), findsOneWidget);
+      expect(find.text('当前时间'), findsOneWidget);
+      expect(find.text('原视频已移除，已将参数套用到当前视频'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'v3.3.0 flows: Live Photo unpack, standalone MP4/JPG export, result gallery link, and batch queue with cancel & retry',
+    (WidgetTester tester) async {
+      final gateway = _ControllableGateway()
+        ..autoCompleteConversions = true
+        ..pickUnpackResult = const UnpackedLivePhoto(
+          videoPath: 'mock://unpacked_live.mov',
+          coverTimeMs: 1200,
+        )
+        ..fileUnpackResult = const UnpackedLivePhoto(
+          videoPath: 'mock://shared_live.mov',
+          coverTimeMs: 800,
+        );
+      final historyStore = InMemoryConversionHistoryStore();
+      final controllers = <_FakeVideoController>[];
+
+      addTearDown(() {
+        gateway.dispose();
+        for (final c in controllers) {
+          c.dispose();
+        }
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      tester.view.physicalSize = const Size(375 * 3, 667 * 3);
+      tester.view.devicePixelRatio = 3.0;
+
+      await tester.pumpWidget(
+        LongLivePhotoApp(
+          gateway: gateway,
+          historyStore: historyStore,
+          debugControllerBuilder: (String path) {
+            final ctrl = _FakeVideoController(
+              duration: const Duration(seconds: 12),
+              position: Duration.zero,
+            );
+            controllers.add(ctrl);
+            return ctrl;
+          },
+          debugFileSizeReader: (_) async => 14 * 1024 * 1024,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // 1. Welcome screen unpacks Live Photo directly into editor
+      await tester.tap(find.byKey(const Key('pick_live_unpack_button')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('export_tools_button')), findsOneWidget);
+      expect(find.textContaining('已拆解实况照片'), findsOneWidget);
+
+      // 2. Top-right export sheet exports standalone MP4 & opens gallery from result sheet
+      await tester.tap(find.byKey(const Key('export_tools_button')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('sheet_export_video')));
+      await tester.pumpAndSettle();
+
+      expect(gateway.lastExportMode, StandaloneExportMode.video);
+      expect(find.text('视频已存入相册'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('result_open_gallery_button')));
+      await tester.pumpAndSettle();
+      expect(gateway.openGalleryCalls, 1);
+      expect(gateway.lastOpenedGalleryTarget, 'content://media/export/video');
+      await tester.tap(find.byKey(const Key('result_done_button')));
+      await tester.pumpAndSettle();
+
+      // 3. Export standalone cover JPG
+      await tester.tap(find.byKey(const Key('export_tools_button')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('sheet_export_cover')));
+      await tester.pumpAndSettle();
+      expect(gateway.lastExportMode, StandaloneExportMode.cover);
+      expect(find.text('封面已存入相册'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('result_done_button')));
+      await tester.pumpAndSettle();
+
+      // 4. Shared media stream: single Motion Photo image unpacks cleanly
+      gateway.sharedMediaController.add(const <SharedMediaItem>[
+        SharedMediaItem(
+          path: 'mock://share_mvimg.jpg',
+          kind: SharedMediaKind.image,
+        ),
+      ]);
+      await tester.pumpAndSettle();
+      expect(controllers.length, 2);
+
+      // 5. Shared media stream: multi-video opens batch queue; test run, failure, retry, and history
+      gateway.failVideoPaths.add('mock://batch_2.mp4');
+      gateway.sharedMediaController.add(const <SharedMediaItem>[
+        SharedMediaItem(
+          path: 'mock://batch_1.mp4',
+          kind: SharedMediaKind.video,
+        ),
+        SharedMediaItem(
+          path: 'mock://batch_2.mp4',
+          kind: SharedMediaKind.video,
+        ),
+      ]);
+      await tester.pumpAndSettle();
+
+      expect(find.text('批量转实况'), findsOneWidget);
+      expect(find.text('batch_1.mp4'), findsOneWidget);
+      expect(find.text('batch_2.mp4'), findsOneWidget);
+
+      await tester.tap(find.byKey(const Key('batch_start_button')));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('已完成 1 / 2 段'), findsOneWidget);
+      expect(find.byKey(const Key('batch_retry_failed_button')), findsOneWidget);
+
+      // Retry failed item after clearing simulated failure
+      gateway.failVideoPaths.clear();
+      await tester.tap(find.byKey(const Key('batch_retry_failed_button')));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('全部 2 段实况已存入系统相册'), findsOneWidget);
+      expect((await historyStore.load()).length, 2);
+
+      await tester.tap(find.byKey(const Key('batch_done_button')));
+      await tester.pumpAndSettle();
+      expect(find.text('记录 2'), findsOneWidget);
+
+      // 6. Mid-batch cancellation cancels current + remaining items cleanly
+      gateway.autoCompleteConversions = false;
+      gateway.sharedMediaController.add(const <SharedMediaItem>[
+        SharedMediaItem(
+          path: 'mock://cancel_1.mp4',
+          kind: SharedMediaKind.video,
+        ),
+        SharedMediaItem(
+          path: 'mock://cancel_2.mp4',
+          kind: SharedMediaKind.video,
+        ),
+      ]);
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('batch_start_button')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(find.byKey(const Key('batch_cancel_button')), findsOneWidget);
+
+      await tester.tap(find.byKey(const Key('batch_cancel_button')));
+      await tester.pumpAndSettle();
+      expect(gateway.cancelCalls, 1);
+      expect(find.textContaining('2 段未完成'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('batch_done_button')));
+      await tester.pumpAndSettle();
+    },
+  );
+
+  testWidgets(
+    'Editor header renders without overflow at 375x667 with 30 history entries and 1.25x Dynamic Type',
+    (WidgetTester tester) async {
+      final gateway = _ControllableGateway();
+      final fakeCtrl = _FakeVideoController();
+      final entries = List<ConversionHistoryEntry>.generate(
+        30,
+        (int i) => ConversionHistoryEntry(
+          id: 'h_$i',
+          createdAtMs: 1700000000000 + i * 1000,
+          sourceVideoPath: 'mock://clip_$i.mp4',
+          savedTarget: 'mock://saved/$i',
+          platformFormat: 'Motion Photo',
+          sourceDurationMs: 10000,
+          outputDurationMs: 10000,
+          outputSizeBytes: 2 * 1024 * 1024,
+          elapsedMs: 1000,
+          qualityWireValue: '1080p',
+          playbackSpeed: 1.0,
+          keepAudio: true,
+          preserveMetadata: true,
+          wasTrimmed: false,
+          coverTimeMs: 500,
+        ),
+      );
+      addTearDown(() {
+        gateway.dispose();
+        fakeCtrl.dispose();
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      tester.view.physicalSize = const Size(375 * 3, 667 * 3);
+      tester.view.devicePixelRatio = 3.0;
+
+      await tester.pumpWidget(
+        MediaQuery(
+          data: const MediaQueryData(textScaler: TextScaler.linear(1.25)),
+          child: LongLivePhotoApp(
+            gateway: gateway,
+            historyStore: InMemoryConversionHistoryStore(entries),
+            debugInitialController: fakeCtrl,
+            debugInitialVideoPath: 'mock://clip.mp4',
+            debugInitialSizeBytes: 20 * 1024 * 1024,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+      expect(find.byKey(const Key('export_tools_button')), findsOneWidget);
     },
   );
 }

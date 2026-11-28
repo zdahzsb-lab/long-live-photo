@@ -12,6 +12,7 @@ abstract class ConversionHistoryStore {
   Future<List<ConversionHistoryEntry>> add(
     ConversionHistoryEntry entry, {
     Uint8List? thumbnailBytes,
+    String? customCoverSourcePath,
   });
 
   Future<List<ConversionHistoryEntry>> removeById(String id);
@@ -52,6 +53,22 @@ class FileConversionHistoryStore implements ConversionHistoryStore {
   String _safeFileStem(String rawId) {
     final cleaned = rawId.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
     return cleaned.isEmpty ? 'entry' : cleaned;
+  }
+
+  String _safeImageExtension(String path) {
+    final dot = path.lastIndexOf('.');
+    if (dot < 0 || dot == path.length - 1) return '.jpg';
+    final ext = path.substring(dot).toLowerCase();
+    switch (ext) {
+      case '.jpg':
+      case '.jpeg':
+      case '.png':
+      case '.heic':
+      case '.webp':
+        return ext;
+      default:
+        return '.jpg';
+    }
   }
 
   Future<void> _deleteThumbnailIfManaged(
@@ -132,6 +149,7 @@ class FileConversionHistoryStore implements ConversionHistoryStore {
   Future<List<ConversionHistoryEntry>> add(
     ConversionHistoryEntry entry, {
     Uint8List? thumbnailBytes,
+    String? customCoverSourcePath,
   }) async {
     final root = await _rootDir();
     final thumbs = await _thumbsDir(root);
@@ -143,6 +161,26 @@ class FileConversionHistoryStore implements ConversionHistoryStore {
       );
       await thumbFile.writeAsBytes(thumbnailBytes, flush: true);
       storedEntry = entry.copyWith(thumbnailPath: thumbFile.path);
+    } else {
+      final coverSrc =
+          (customCoverSourcePath != null && customCoverSourcePath.isNotEmpty)
+              ? customCoverSourcePath
+              : entry.customCoverPath;
+      if (coverSrc != null && coverSrc.isNotEmpty) {
+        try {
+          final srcFile = File(coverSrc);
+          if (await srcFile.exists()) {
+            final ext = _safeImageExtension(coverSrc);
+            final thumbFile = File(
+              '${thumbs.path}${Platform.pathSeparator}${_safeFileStem(entry.id)}$ext',
+            );
+            await srcFile.copy(thumbFile.path);
+            storedEntry = entry.copyWith(thumbnailPath: thumbFile.path);
+          }
+        } catch (_) {
+          // Best-effort custom cover persistence.
+        }
+      }
     }
 
     final existing = await load();
@@ -232,6 +270,7 @@ class InMemoryConversionHistoryStore implements ConversionHistoryStore {
   Future<List<ConversionHistoryEntry>> add(
     ConversionHistoryEntry entry, {
     Uint8List? thumbnailBytes,
+    String? customCoverSourcePath,
   }) async {
     _entries.removeWhere((ConversionHistoryEntry e) => e.id == entry.id);
     _entries.insert(0, entry);

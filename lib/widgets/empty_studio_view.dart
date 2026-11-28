@@ -3,6 +3,7 @@ import 'package:material_ui/material_ui.dart';
 
 import '../theme/ui_tokens.dart';
 import '../ui/buttons.dart';
+import '../ui/pressable.dart';
 
 /// Editorial Swiss-minimalist welcome screen.
 ///
@@ -16,12 +17,16 @@ class EmptyStudioView extends StatelessWidget {
     required this.isBusy,
     required this.onPickGallery,
     required this.onPickFiles,
+    required this.onPickBatch,
+    required this.onPickLiveUnpack,
   });
 
   final String platformTag;
   final bool isBusy;
   final VoidCallback onPickGallery;
   final VoidCallback onPickFiles;
+  final VoidCallback onPickBatch;
+  final VoidCallback onPickLiveUnpack;
 
   @override
   Widget build(BuildContext context) {
@@ -118,12 +123,38 @@ class EmptyStudioView extends StatelessWidget {
               onTap: onPickGallery,
             ),
             const SizedBox(height: Ui.s3),
-            SecondaryButton(
-              key: const Key('pick_file_button'),
-              label: '从文件导入',
-              icon: LucideIcons.folderOpen,
-              enabled: !isBusy,
-              onTap: onPickFiles,
+            Row(
+              children: <Widget>[
+                Expanded(
+                  child: _CompactActionTile(
+                    key: const Key('pick_batch_button'),
+                    label: '批量多选',
+                    icon: LucideIcons.layers,
+                    enabled: !isBusy,
+                    onTap: onPickBatch,
+                  ),
+                ),
+                const SizedBox(width: Ui.s2),
+                Expanded(
+                  child: _CompactActionTile(
+                    key: const Key('pick_live_unpack_button'),
+                    label: '实况拆解',
+                    icon: LucideIcons.sparkles,
+                    enabled: !isBusy,
+                    onTap: onPickLiveUnpack,
+                  ),
+                ),
+                const SizedBox(width: Ui.s2),
+                Expanded(
+                  child: _CompactActionTile(
+                    key: const Key('pick_file_button'),
+                    label: '文件导入',
+                    icon: LucideIcons.folderOpen,
+                    enabled: !isBusy,
+                    onTap: onPickFiles,
+                  ),
+                ),
+              ],
             ),
           ],
         );
@@ -149,6 +180,63 @@ class EmptyStudioView extends StatelessWidget {
           ],
         );
       },
+    );
+  }
+}
+
+class _CompactActionTile extends StatelessWidget {
+  const _CompactActionTile({
+    super.key,
+    required this.label,
+    required this.icon,
+    required this.enabled,
+    required this.onTap,
+  });
+
+  final String label;
+  final IconData icon;
+  final bool enabled;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Pressable(
+      onTap: onTap,
+      enabled: enabled,
+      expandWidth: true,
+      maxInsetPx: 4.0,
+      minSize: const Size(0, Ui.minTarget),
+      semanticLabel: label,
+      child: Container(
+        height: 44,
+        padding: const EdgeInsets.symmetric(horizontal: Ui.s2),
+        decoration: BoxDecoration(
+          color: Ui.surface,
+          borderRadius: BorderRadius.circular(Ui.rMd),
+          border: Border.all(color: Ui.hairline),
+        ),
+        child: Center(
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                Icon(icon, size: 15, color: Ui.textSecondary),
+                const SizedBox(width: 5),
+                Text(
+                  label,
+                  maxLines: 1,
+                  style: Ui.callout.copyWith(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: Ui.textPrimary,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 }

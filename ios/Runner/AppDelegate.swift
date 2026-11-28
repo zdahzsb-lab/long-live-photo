@@ -2,14 +2,252 @@ import Flutter
 import UIKit
 import AVFoundation
 import Photos
+import PhotosUI
 import ImageIO
 import UniformTypeIdentifiers
 import CoreMedia
 import CoreLocation
 
+final class SharedMediaBridge: NSObject, FlutterStreamHandler {
+  static let shared = SharedMediaBridge()
+
+  private let lock = NSLock()
+  private let ioQueue = DispatchQueue(label: "com.longlive.sharedMedia")
+  private var eventSink: FlutterEventSink?
+  private var pendingItems: [[String: String]] = []
+
+  func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
+    lock.lock()
+    eventSink = events
+    lock.unlock()
+    return nil
+  }
+
+  func onCancel(withArguments arguments: Any?) -> FlutterError? {
+    lock.lock()
+    eventSink = nil
+    lock.unlock()
+    return nil
+  }
+
+  func consumeInitial() -> [[String: String]] {
+    lock.lock()
+    let items = pendingItems
+    pendingItems.removeAll()
+    lock.unlock()
+    return items
+  }
+
+  func ingest(urlContexts: Set<UIOpenURLContext>) {
+    let urls = urlContexts.map { $0.url }
+    guard !urls.isEmpty else { return }
+
+    ioQueue.async { [weak self] in
+      guard let self = self else { return }
+      let importDir = FileManager.default.temporaryDirectory.appendingPathComponent("shared_imports", isDirectory: true)
+      try? FileManager.default.createDirectory(at: importDir, withIntermediateDirectories: true)
+      self.pruneOldFiles(in: importDir, maxAgeSec: 24 * 3600)
+
+      var imported: [[String: String]] = []
+      for url in urls {
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer {
+          if accessing {
+            url.stopAccessingSecurityScopedResource()
+          }
+        }
+        guard url.isFileURL else { continue }
+
+        let ext = url.pathExtension.lowercased()
+        let isImage = ["jpg", "jpeg", "heic", "heif", "png", "webp", "pvt", "livephoto"].contains(ext)
+        let kind = isImage ? "image" : "video"
+        let dstExt = ext.isEmpty ? (isImage ? "jpg" : "mp4") : ext
+        let dstURL = importDir.appendingPathComponent("share_\(Int(Date().timeIntervalSince1970 * 1000))_\(UUID().uuidString.prefix(8)).\(dstExt)")
+
+        do {
+          if FileManager.default.fileExists(atPath: dstURL.path) {
+            try FileManager.default.removeItem(at: dstURL)
+          }
+          try FileManager.default.copyItem(at: url, to: dstURL)
+          imported.append([
+            "path": dstURL.path,
+            "kind": kind
+          ])
+        } catch {
+          continue
+        }
+      }
+
+      guard !imported.isEmpty else { return }
+      DispatchQueue.main.async {
+        self.lock.lock()
+        let sink = self.eventSink
+        if sink == nil {
+          self.pendingItems.append(contentsOf: imported)
+        }
+        self.lock.unlock()
+        sink?(imported)
+      }
+    }
+  }
+
+  private func pruneOldFiles(in dir: URL, maxAgeSec: TimeInterval) {
+    let cutoff = Date().addingTimeInterval(-maxAgeSec)
+    guard let children = try? FileManager.default.contentsOfDirectory(
+      at: dir,
+      includingPropertiesForKeys: [.contentModificationDateKey],
+      options: [.skipsHiddenFiles]
+    ) else { return }
+    for item in children {
+      if let vals = try? item.resourceValues(forKeys: [.contentModificationDateKey]),
+         let modified = vals.contentModificationDate,
+         modified < cutoff {
+        try? FileManager.default.removeItem(at: item)
+      }
+    }
+  }
+}
+
+final class LivePhotoPickerCoordinator: NSObject, PHPickerViewControllerDelegate, UIAdaptivePresentationControllerDelegate {
+  private let completion: ([String: Any]?, FlutterError?) -> Void
+  private let workQueue = DispatchQueue(label: "com.longlive.livePhotoUnpack")
+  private var didComplete = false
+
+  init(completion: @escaping ([String: Any]?, FlutterError?) -> Void) {
+    self.completion = completion
+  }
+
+  private func finish(_ payload: [String: Any]?, _ error: FlutterError?) {
+    if didComplete { return }
+    didComplete = true
+    completion(payload, error)
+  }
+
+  func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+    finish(nil, nil)
+  }
+
+  func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+    picker.dismiss(animated: true)
+
+    guard let provider = results.first?.itemProvider else {
+      finish(nil, nil)
+      return
+    }
+    guard provider.canLoadObject(ofClass: PHLivePhoto.self) else {
+      finish(
+        nil,
+        FlutterError(code: "NOT_LIVE_PHOTO", message: "所选项目不是有效的实况照片", details: nil)
+      )
+      return
+    }
+
+    provider.loadObject(ofClass: PHLivePhoto.self) { [weak self] object, error in
+      guard let self = self else { return }
+      if let error = error {
+        DispatchQueue.main.async {
+          self.finish(
+            nil,
+            FlutterError(code: "LOAD_LIVE_FAILED", message: "读取实况照片失败：\(error.localizedDescription)", details: nil)
+          )
+        }
+        return
+      }
+      guard let livePhoto = object as? PHLivePhoto else {
+        DispatchQueue.main.async {
+          self.finish(
+            nil,
+            FlutterError(code: "NOT_LIVE_PHOTO", message: "未能解析为实况照片", details: nil)
+          )
+        }
+        return
+      }
+
+      self.extractResources(from: livePhoto)
+    }
+  }
+
+  private func extractResources(from livePhoto: PHLivePhoto) {
+    let resources = PHAssetResource.assetResources(for: livePhoto)
+    guard let videoRes = resources.first(where: { $0.type == .pairedVideo }) else {
+      DispatchQueue.main.async {
+        self.finish(
+          nil,
+          FlutterError(code: "NOT_LIVE_PHOTO", message: "所选照片不包含内嵌实况视频轨", details: nil)
+        )
+      }
+      return
+    }
+    let photoRes = resources.first(where: { $0.type == .fullSizePhoto })
+      ?? resources.first(where: { $0.type == .photo })
+
+    let unpackDir = FileManager.default.temporaryDirectory.appendingPathComponent("unpacked_live", isDirectory: true)
+    try? FileManager.default.createDirectory(at: unpackDir, withIntermediateDirectories: true)
+
+    let stamp = "\(Int(Date().timeIntervalSince1970 * 1000))_\(UUID().uuidString.prefix(8))"
+    let videoOutURL = unpackDir.appendingPathComponent("unpacked_\(stamp).mov")
+    let rawPhotoURL = unpackDir.appendingPathComponent("unpacked_raw_\(stamp).img")
+    let coverJpgURL = unpackDir.appendingPathComponent("unpacked_cover_\(stamp).jpg")
+
+    try? FileManager.default.removeItem(at: videoOutURL)
+    try? FileManager.default.removeItem(at: rawPhotoURL)
+    try? FileManager.default.removeItem(at: coverJpgURL)
+
+    let options = PHAssetResourceRequestOptions()
+    options.isNetworkAccessAllowed = true
+
+    PHAssetResourceManager.default().writeData(for: videoRes, toFile: videoOutURL, options: options) { [weak self] videoErr in
+      guard let self = self else { return }
+      if let videoErr = videoErr {
+        DispatchQueue.main.async {
+          self.finish(
+            nil,
+            FlutterError(code: "UNPACK_FAILED", message: "提取实况视频失败：\(videoErr.localizedDescription)", details: nil)
+          )
+        }
+        return
+      }
+
+      let finalizeResult = { (coverPath: String?) in
+        self.workQueue.async {
+          let stillMs = AppDelegate.readStillImageTimeMs(from: videoOutURL)
+          var payload: [String: Any] = [
+            "videoPath": videoOutURL.path,
+            "coverTimeMs": stillMs
+          ]
+          if let coverPath = coverPath {
+            payload["coverImagePath"] = coverPath
+          }
+          DispatchQueue.main.async {
+            self.finish(payload, nil)
+          }
+        }
+      }
+
+      guard let pRes = photoRes else {
+        finalizeResult(nil)
+        return
+      }
+
+      PHAssetResourceManager.default().writeData(for: pRes, toFile: rawPhotoURL, options: options) { photoErr in
+        if photoErr != nil {
+          finalizeResult(nil)
+          return
+        }
+        self.workQueue.async {
+          let normalized = AppDelegate.normalizeImageToJpeg(sourceURL: rawPhotoURL, destURL: coverJpgURL)
+          try? FileManager.default.removeItem(at: rawPhotoURL)
+          finalizeResult(normalized ? coverJpgURL.path : nil)
+        }
+      }
+    }
+  }
+}
+
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterStreamHandler, FlutterImplicitEngineDelegate {
   private var eventSink: FlutterEventSink?
+  private var activePickerCoordinator: LivePhotoPickerCoordinator?
 
   private let stateLock = NSLock()
   private var isCancelled = false
@@ -76,6 +314,54 @@ import CoreLocation
         let count = max(1, min((args["count"] as? NSNumber)?.intValue ?? 8, 16))
         self?.handleExtractThumbnails(videoPath: videoPath, count: count, result: result)
 
+      case "consumeInitialSharedMedia":
+        result(SharedMediaBridge.shared.consumeInitial())
+
+      case "openSystemGallery":
+        self?.handleOpenSystemGallery(result: result)
+
+      case "pickAndUnpackLivePhoto":
+        self?.handlePickAndUnpackLivePhoto(result: result)
+
+      case "unpackLivePhotoFile":
+        guard let args = call.arguments as? [String: Any],
+              let filePath = args["filePath"] as? String else {
+          result(FlutterError(code: "INVALID_ARGS", message: "缺少文件路径参数", details: nil))
+          return
+        }
+        self?.handleUnpackLivePhotoFile(filePath: filePath, result: result)
+
+      case "exportStandaloneMedia":
+        guard let args = call.arguments as? [String: Any],
+              let videoPath = args["videoPath"] as? String else {
+          result(FlutterError(code: "INVALID_ARGS", message: "缺少视频文件路径参数", details: nil))
+          return
+        }
+        let mode = (args["mode"] as? String) ?? "video"
+        let coverTimeMs = (args["coverTimeMs"] as? NSNumber)?.int64Value ?? 0
+        let quality = (args["quality"] as? String) ?? "passthrough"
+        let keepAudio = (args["keepAudio"] as? Bool) ?? true
+        let customCoverPath = args["customCoverPath"] as? String
+        let trimStartMs = (args["trimStartMs"] as? NSNumber)?.int64Value
+        let trimEndMs = (args["trimEndMs"] as? NSNumber)?.int64Value
+        let preserveMetadata = (args["preserveMetadata"] as? Bool) ?? true
+        let rawSpeed = (args["playbackSpeed"] as? NSNumber)?.doubleValue ?? 1.0
+        let playbackSpeed = min(max(rawSpeed, 0.5), 4.0)
+
+        self?.handleExportStandaloneMedia(
+          mode: mode,
+          videoPath: videoPath,
+          coverTimeMs: coverTimeMs,
+          quality: quality,
+          keepAudio: keepAudio,
+          customCoverPath: customCoverPath,
+          trimStartMs: trimStartMs,
+          trimEndMs: trimEndMs,
+          preserveMetadata: preserveMetadata,
+          playbackSpeed: playbackSpeed,
+          result: result
+        )
+
       default:
         result(FlutterMethodNotImplemented)
       }
@@ -86,6 +372,12 @@ import CoreLocation
       binaryMessenger: messenger
     )
     progressChannel.setStreamHandler(self)
+
+    let sharedMediaChannel = FlutterEventChannel(
+      name: "com.longlive.long_live_photo/shared_media",
+      binaryMessenger: messenger
+    )
+    sharedMediaChannel.setStreamHandler(SharedMediaBridge.shared)
   }
 
   public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
@@ -493,7 +785,7 @@ import CoreLocation
     at time: CMTime,
     trimStartTime: CMTime,
     customCoverPath: String?,
-    assetIdentifier: String,
+    assetIdentifier: String?,
     captureDate: Date?,
     location: CLLocation?,
     preserveMetadata: Bool,
@@ -547,11 +839,13 @@ import CoreLocation
     }
 
     var properties: [String: Any] = [
-      kCGImageDestinationLossyCompressionQuality as String: 0.92,
-      kCGImagePropertyMakerAppleDictionary as String: [
-        "17": assetIdentifier
-      ]
+      kCGImageDestinationLossyCompressionQuality as String: 0.92
     ]
+    if let identifier = assetIdentifier, !identifier.isEmpty {
+      properties[kCGImagePropertyMakerAppleDictionary as String] = [
+        "17": identifier
+      ]
+    }
 
     if preserveMetadata {
       if let date = captureDate {
@@ -595,6 +889,30 @@ import CoreLocation
     return String(format: "%.1fx 倍速", speed)
   }
 
+  private func isHdrVideoTrack(_ videoTrack: AVAssetTrack, formatDesc: CMFormatDescription?) -> Bool {
+    if videoTrack.hasMediaCharacteristic(.containsHDRVideo) {
+      return true
+    }
+    guard let desc = formatDesc else { return false }
+    if CMFormatDescriptionGetMediaSubType(desc) == kCMVideoCodecType_DolbyVisionHEVC {
+      return true
+    }
+    if let extensions = CMFormatDescriptionGetExtensions(desc) as? [CFString: Any] {
+      if let tf = extensions[kCMFormatDescriptionExtension_TransferFunction] as? String {
+        let hlg = kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String
+        let pq = kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String
+        if tf == hlg || tf == pq {
+          return true
+        }
+      }
+      if let primaries = extensions[kCMFormatDescriptionExtension_ColorPrimaries] as? String,
+         primaries == (kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String) {
+        return true
+      }
+    }
+    return false
+  }
+
   private func buildPairedLiveVideo(
     asset: AVAsset,
     trimRange: CMTimeRange,
@@ -602,7 +920,7 @@ import CoreLocation
     trimStartSec: Double,
     trimDurationSec: Double,
     stillImageTime: CMTime,
-    assetIdentifier: String,
+    assetIdentifier: String?,
     quality: String,
     keepAudio: Bool,
     playbackSpeed: Double,
@@ -679,40 +997,48 @@ import CoreLocation
         reader.timeRange = trimRange
       }
 
-      let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
+      let fileType: AVFileType = (assetIdentifier != nil) ? .mov : .mp4
+      let writer = try AVAssetWriter(outputURL: outputURL, fileType: fileType)
       resetCancellationAndSetPipeline(reader: reader, writer: writer)
 
-      // 1. Top-level QuickTime ContentIdentifier matching MakerApple "17"
-      let idMetadata = AVMutableMetadataItem()
-      idMetadata.key = AVMetadataKey.quickTimeMetadataKeyContentIdentifier as NSString
-      idMetadata.keySpace = .quickTimeMetadata
-      idMetadata.value = assetIdentifier as NSString
-      idMetadata.dataType = kCMMetadataBaseDataType_UTF8 as String
-      writer.metadata = [idMetadata]
+      var metadataInput: AVAssetWriterInput?
+      var metadataAdaptor: AVAssetWriterInputMetadataAdaptor?
 
-      // 2. Timed metadata track for com.apple.quicktime.still-image-time
-      let stillTimeSpec: NSDictionary = [
-        kCMMetadataFormatDescriptionMetadataSpecificationKey_Identifier: "mdta/com.apple.quicktime.still-image-time",
-        kCMMetadataFormatDescriptionMetadataSpecificationKey_DataType: kCMMetadataBaseDataType_SInt8
-      ]
-      var metadataFormatDesc: CMFormatDescription?
-      CMMetadataFormatDescriptionCreateWithMetadataSpecifications(
-        allocator: kCFAllocatorDefault,
-        metadataType: kCMMetadataFormatType_Boxed,
-        metadataSpecifications: [stillTimeSpec] as CFArray,
-        formatDescriptionOut: &metadataFormatDesc
-      )
-      let metadataInput = AVAssetWriterInput(
-        mediaType: .metadata,
-        outputSettings: nil,
-        sourceFormatHint: metadataFormatDesc
-      )
-      let metadataAdaptor = AVAssetWriterInputMetadataAdaptor(assetWriterInput: metadataInput)
-      if writer.canAdd(metadataInput) {
-        writer.add(metadataInput)
+      if let identifier = assetIdentifier, !identifier.isEmpty {
+        // 1. Top-level QuickTime ContentIdentifier matching MakerApple "17"
+        let idMetadata = AVMutableMetadataItem()
+        idMetadata.key = AVMetadataKey.quickTimeMetadataKeyContentIdentifier as NSString
+        idMetadata.keySpace = .quickTimeMetadata
+        idMetadata.value = identifier as NSString
+        idMetadata.dataType = kCMMetadataBaseDataType_UTF8 as String
+        writer.metadata = [idMetadata]
+
+        // 2. Timed metadata track for com.apple.quicktime.still-image-time
+        let stillTimeSpec: NSDictionary = [
+          kCMMetadataFormatDescriptionMetadataSpecificationKey_Identifier: "mdta/com.apple.quicktime.still-image-time",
+          kCMMetadataFormatDescriptionMetadataSpecificationKey_DataType: kCMMetadataBaseDataType_SInt8
+        ]
+        var metadataFormatDesc: CMFormatDescription?
+        CMMetadataFormatDescriptionCreateWithMetadataSpecifications(
+          allocator: kCFAllocatorDefault,
+          metadataType: kCMMetadataFormatType_Boxed,
+          metadataSpecifications: [stillTimeSpec] as CFArray,
+          formatDescriptionOut: &metadataFormatDesc
+        )
+        let mInput = AVAssetWriterInput(
+          mediaType: .metadata,
+          outputSettings: nil,
+          sourceFormatHint: metadataFormatDesc
+        )
+        let mAdaptor = AVAssetWriterInputMetadataAdaptor(assetWriterInput: mInput)
+        if writer.canAdd(mInput) {
+          writer.add(mInput)
+          metadataInput = mInput
+          metadataAdaptor = mAdaptor
+        }
       }
 
-      // 3. Configure video reader output & writer input (Passthrough vs Hardware H.264)
+      // 3. Configure video reader output & writer input (Passthrough vs Hardware H.264 with HDR tone-mapping)
       let sourceFormatDesc: CMFormatDescription? = videoTrack.formatDescriptions.isEmpty
         ? nil
         : (videoTrack.formatDescriptions[0] as! CMFormatDescription)
@@ -721,7 +1047,7 @@ import CoreLocation
       // Raw compressed passthrough is reserved for untrimmed 1x clips so trimmed/speed-scaled cuts re-encode cleanly.
       let usePassthrough = !isTrimmed && !hasSpeedChange && (quality == "passthrough" && canPassthroughCodec)
 
-      let readerVideoOutput: AVAssetReaderTrackOutput
+      let readerVideoOutput: AVAssetReaderOutput
       let writerVideoInput: AVAssetWriterInput
 
       if usePassthrough {
@@ -729,31 +1055,66 @@ import CoreLocation
         writerVideoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: sourceFormatDesc)
         writerVideoInput.transform = videoTrack.preferredTransform
       } else {
-        readerVideoOutput = AVAssetReaderTrackOutput(
-          track: readerVideoTrack,
-          outputSettings: [
-            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
-          ]
-        )
-        let (targetW, targetH, bitrate) = computeEncodingParams(
-          naturalSize: videoTrack.naturalSize,
-          quality: quality
-        )
+        let isHdr = isHdrVideoTrack(videoTrack, formatDesc: sourceFormatDesc)
+        let targetW: Int
+        let targetH: Int
+        let bitrate: Int
+
+        if isHdr {
+          let videoComp = AVMutableVideoComposition(propertiesOf: readerAsset)
+          if !videoComp.frameDuration.isValid || CMTimeGetSeconds(videoComp.frameDuration) <= 0 {
+            videoComp.frameDuration = CMTime(value: 1, timescale: 30)
+          }
+          videoComp.colorPrimaries = AVVideoColorPrimaries_ITU_R_709_2
+          videoComp.colorTransferFunction = AVVideoTransferFunction_ITU_R_709_2
+          videoComp.colorYCbCrMatrix = AVVideoYCbCrMatrix_ITU_R_709_2
+          (targetW, targetH, bitrate) = computeEncodingParams(
+            naturalSize: videoComp.renderSize,
+            quality: quality
+          )
+          let compOut = AVAssetReaderVideoCompositionOutput(
+            videoTracks: [readerVideoTrack],
+            videoSettings: [
+              kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+            ]
+          )
+          compOut.videoComposition = videoComp
+          readerVideoOutput = compOut
+        } else {
+          readerVideoOutput = AVAssetReaderTrackOutput(
+            track: readerVideoTrack,
+            outputSettings: [
+              kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+            ]
+          )
+          (targetW, targetH, bitrate) = computeEncodingParams(
+            naturalSize: videoTrack.naturalSize,
+            quality: quality
+          )
+        }
+
         let videoSettings: [String: Any] = [
           AVVideoCodecKey: AVVideoCodecType.h264,
           AVVideoWidthKey: targetW,
           AVVideoHeightKey: targetH,
+          AVVideoColorPropertiesKey: [
+            AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+            AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+            AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+          ],
           AVVideoCompressionPropertiesKey: [
             AVVideoAverageBitRateKey: bitrate,
             AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
           ]
         ]
         writerVideoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        writerVideoInput.transform = scaledTransform(
-          original: videoTrack.preferredTransform,
-          targetWidth: targetW,
-          targetHeight: targetH
-        )
+        writerVideoInput.transform = isHdr
+          ? .identity
+          : scaledTransform(
+              original: videoTrack.preferredTransform,
+              targetWidth: targetW,
+              targetHeight: targetH
+            )
       }
       readerVideoOutput.alwaysCopiesSampleData = false
       writerVideoInput.expectsMediaDataInRealTime = false
@@ -837,16 +1198,18 @@ import CoreLocation
       let sessionStartTime = (!hasSpeedChange && isTrimmed) ? trimRange.start : CMTime.zero
       writer.startSession(atSourceTime: sessionStartTime)
 
-      // Write still-image-time marker in the same timeline
-      let stillItem = AVMutableMetadataItem()
-      stillItem.key = "com.apple.quicktime.still-image-time" as NSString
-      stillItem.keySpace = .quickTimeMetadata
-      stillItem.value = 0 as NSNumber
-      stillItem.dataType = kCMMetadataBaseDataType_SInt8 as String
-      let frameDur = CMTime(value: 1, timescale: 600)
-      let group = AVTimedMetadataGroup(items: [stillItem], timeRange: CMTimeRange(start: stillImageTime, duration: frameDur))
-      metadataAdaptor.append(group)
-      metadataInput.markAsFinished()
+      if let mAdaptor = metadataAdaptor, let mInput = metadataInput {
+        // Write still-image-time marker in the same timeline
+        let stillItem = AVMutableMetadataItem()
+        stillItem.key = "com.apple.quicktime.still-image-time" as NSString
+        stillItem.keySpace = .quickTimeMetadata
+        stillItem.value = 0 as NSNumber
+        stillItem.dataType = kCMMetadataBaseDataType_SInt8 as String
+        let frameDur = CMTime(value: 1, timescale: 600)
+        let group = AVTimedMetadataGroup(items: [stillItem], timeRange: CMTimeRange(start: stillImageTime, duration: frameDur))
+        mAdaptor.append(group)
+        mInput.markAsFinished()
+      }
 
       let pumpGroup = DispatchGroup()
       let videoQueue = DispatchQueue(label: "com.longlive.videoPump")
@@ -1049,6 +1412,516 @@ import CoreLocation
       DispatchQueue.main.async {
         result(frames)
       }
+    }
+  }
+
+  private func topMostViewController() -> UIViewController? {
+    let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    let activeScene = scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first
+    guard let root = activeScene?.windows.first(where: { $0.isKeyWindow })?.rootViewController
+      ?? activeScene?.windows.first?.rootViewController else {
+      return nil
+    }
+    var top = root
+    while let presented = top.presentedViewController {
+      top = presented
+    }
+    return top
+  }
+
+  private func handleOpenSystemGallery(result: @escaping FlutterResult) {
+    DispatchQueue.main.async {
+      guard let url = URL(string: "photos-redirect://") else {
+        result(false)
+        return
+      }
+      UIApplication.shared.open(url, options: [:]) { success in
+        result(success)
+      }
+    }
+  }
+
+  private func handlePickAndUnpackLivePhoto(result: @escaping FlutterResult) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      if self.activePickerCoordinator != nil {
+        result(FlutterError(code: "BUSY", message: "正在选择实况照片，请稍候", details: nil))
+        return
+      }
+      guard let presenter = self.topMostViewController() else {
+        result(FlutterError(code: "NO_VIEW_CONTROLLER", message: "无法打开系统相册选择器", details: nil))
+        return
+      }
+
+      var config = PHPickerConfiguration(photoLibrary: .shared())
+      config.filter = .livePhotos
+      config.selectionLimit = 1
+
+      let picker = PHPickerViewController(configuration: config)
+      let coordinator = LivePhotoPickerCoordinator { [weak self] payload, error in
+        self?.activePickerCoordinator = nil
+        if let error = error {
+          result(error)
+        } else {
+          result(payload)
+        }
+      }
+      self.activePickerCoordinator = coordinator
+      picker.delegate = coordinator
+      picker.presentationController?.delegate = coordinator
+      presenter.present(picker, animated: true)
+    }
+  }
+
+  private func handleUnpackLivePhotoFile(filePath: String, result: @escaping FlutterResult) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      var isDir: ObjCBool = false
+      guard FileManager.default.fileExists(atPath: filePath, isDirectory: &isDir) else {
+        DispatchQueue.main.async {
+          result(FlutterError(code: "FILE_NOT_FOUND", message: "找不到所选实况文件", details: nil))
+        }
+        return
+      }
+
+      let unpackDir = FileManager.default.temporaryDirectory.appendingPathComponent("unpacked_live", isDirectory: true)
+      try? FileManager.default.createDirectory(at: unpackDir, withIntermediateDirectories: true)
+      let stamp = "\(Int(Date().timeIntervalSince1970 * 1000))_\(UUID().uuidString.prefix(8))"
+      let inputURL = URL(fileURLWithPath: filePath)
+
+      if isDir.boolValue {
+        let children = (try? FileManager.default.contentsOfDirectory(at: inputURL, includingPropertiesForKeys: nil)) ?? []
+        guard let videoChild = children.first(where: { ["mov", "mp4", "m4v"].contains($0.pathExtension.lowercased()) }) else {
+          DispatchQueue.main.async {
+            result(FlutterError(code: "NOT_LIVE_PHOTO", message: "所选实况包中不包含视频文件", details: nil))
+          }
+          return
+        }
+        let outVideo = unpackDir.appendingPathComponent("unpacked_\(stamp).\(videoChild.pathExtension.lowercased())")
+        let outCover = unpackDir.appendingPathComponent("unpacked_cover_\(stamp).jpg")
+        do {
+          try FileManager.default.copyItem(at: videoChild, to: outVideo)
+        } catch {
+          DispatchQueue.main.async {
+            result(FlutterError(code: "UNPACK_FAILED", message: "提取实况视频失败：\(error.localizedDescription)", details: nil))
+          }
+          return
+        }
+        var coverPath: String?
+        if let imgChild = children.first(where: { ["jpg", "jpeg", "heic", "heif", "png"].contains($0.pathExtension.lowercased()) }),
+           AppDelegate.normalizeImageToJpeg(sourceURL: imgChild, destURL: outCover) {
+          coverPath = outCover.path
+        }
+        let stillMs = AppDelegate.readStillImageTimeMs(from: outVideo)
+        var payload: [String: Any] = [
+          "videoPath": outVideo.path,
+          "coverTimeMs": stillMs
+        ]
+        if let coverPath = coverPath {
+          payload["coverImagePath"] = coverPath
+        }
+        DispatchQueue.main.async { result(payload) }
+        return
+      }
+
+      // Single-file Motion Photo JPEG (e.g., Android MVIMG transferred to iOS)
+      if let unpacked = AppDelegate.unpackMotionPhotoJpeg(sourceURL: inputURL, outDir: unpackDir, stamp: stamp) {
+        DispatchQueue.main.async { result(unpacked) }
+      } else {
+        DispatchQueue.main.async {
+          result(FlutterError(code: "NOT_LIVE_PHOTO", message: "所选图片不包含可拆解的实况视频轨道", details: nil))
+        }
+      }
+    }
+  }
+
+  private func handleExportStandaloneMedia(
+    mode: String,
+    videoPath: String,
+    coverTimeMs: Int64,
+    quality: String,
+    keepAudio: Bool,
+    customCoverPath: String?,
+    trimStartMs: Int64?,
+    trimEndMs: Int64?,
+    preserveMetadata: Bool,
+    playbackSpeed: Double,
+    result: @escaping FlutterResult
+  ) {
+    PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
+      guard let self = self else { return }
+      guard status == .authorized || status == .limited else {
+        DispatchQueue.main.async {
+          result(FlutterError(
+            code: "PHOTO_PERMISSION_DENIED",
+            message: "请在系统“设置 → 隐私与安全性 → 照片”中允许 Unclip 添加照片",
+            details: nil
+          ))
+        }
+        return
+      }
+
+      self.prepareNewConversionState()
+      self.beginKeepAwakeAndBackgroundTask()
+
+      DispatchQueue.global(qos: .userInitiated).async {
+        let startTime = CFAbsoluteTimeGetCurrent()
+        let inputURL = URL(fileURLWithPath: videoPath)
+        guard FileManager.default.fileExists(atPath: inputURL.path) else {
+          self.endKeepAwakeAndBackgroundTask()
+          DispatchQueue.main.async {
+            result(FlutterError(code: "FILE_NOT_FOUND", message: "找不到所选视频文件", details: nil))
+          }
+          return
+        }
+
+        let asset = AVURLAsset(url: inputURL)
+        let durationSeconds = max(CMTimeGetSeconds(asset.duration), 0.1)
+
+        let requestedStartSec = trimStartMs.map { max(0.0, Double($0) / 1000.0) } ?? 0.0
+        var requestedEndSec = trimEndMs.map { min(durationSeconds, Double($0) / 1000.0) } ?? durationSeconds
+        if requestedEndSec - requestedStartSec < 0.2 {
+          requestedEndSec = min(durationSeconds, requestedStartSec + 0.2)
+        }
+        let trimStartSec = min(requestedStartSec, max(0.0, requestedEndSec - 0.1))
+        let trimEndSec = max(trimStartSec + 0.1, min(requestedEndSec, durationSeconds))
+        let trimDurationSec = max(trimEndSec - trimStartSec, 0.1)
+        let isTrimmed = (trimStartSec > 0.05) || (trimEndSec < durationSeconds - 0.05)
+
+        let requestedCoverSec = Double(max(coverTimeMs, 0)) / 1000.0
+        let maxCoverSec = max(trimStartSec, trimEndSec - 0.05)
+        let clampedCoverSec = min(max(requestedCoverSec, trimStartSec), maxCoverSec)
+        let coverCMTime = CMTime(seconds: clampedCoverSec, preferredTimescale: 600)
+
+        let (sourceDate, sourceLocation) = preserveMetadata
+          ? self.extractSourceMetadata(asset: asset)
+          : (nil, nil)
+
+        let workId = UUID().uuidString
+        let tempDir = FileManager.default.temporaryDirectory
+          .appendingPathComponent("export_work_\(workId)", isDirectory: true)
+        do {
+          try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        } catch {
+          self.endKeepAwakeAndBackgroundTask()
+          DispatchQueue.main.async {
+            result(FlutterError(code: "TEMP_DIR_ERROR", message: "无法创建临时工作目录：\(error.localizedDescription)", details: nil))
+          }
+          return
+        }
+
+        let cleanup = { [weak self] in
+          self?.resetCancellationAndSetPipeline(reader: nil, writer: nil)
+          try? FileManager.default.removeItem(at: tempDir)
+        }
+
+        if mode == "cover" {
+          let coverURL = tempDir.appendingPathComponent("IMG_Unclip_\(workId).JPG")
+          self.emitProgress(stage: "cover", progress: 0.45, message: customCoverPath != nil ? "正在导出自定义高清封面..." : "正在提取当前高清封面...")
+          do {
+            try self.writeStillImageWithIdentifier(
+              asset: asset,
+              at: coverCMTime,
+              trimStartTime: CMTime(seconds: trimStartSec, preferredTimescale: 600),
+              customCoverPath: customCoverPath,
+              assetIdentifier: nil,
+              captureDate: sourceDate,
+              location: sourceLocation,
+              preserveMetadata: preserveMetadata,
+              outputURL: coverURL
+            )
+          } catch {
+            cleanup()
+            self.endKeepAwakeAndBackgroundTask()
+            DispatchQueue.main.async {
+              result(FlutterError(code: "COVER_EXPORT_FAILED", message: "导出高清封面失败：\(error.localizedDescription)", details: nil))
+            }
+            return
+          }
+
+          let photoBytes = (try? FileManager.default.attributesOfItem(atPath: coverURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+          self.emitProgress(stage: "saving", progress: 0.94, message: "正在写入 iPhone 系统“照片”...")
+          var placeholderId = ""
+          PHPhotoLibrary.shared().performChanges({
+            let req = PHAssetCreationRequest.forAsset()
+            let opts = PHAssetResourceCreationOptions()
+            opts.shouldMoveFile = true
+            req.addResource(with: .photo, fileURL: coverURL, options: opts)
+            if preserveMetadata {
+              if let capturedAt = sourceDate { req.creationDate = capturedAt }
+              if let capturedLoc = sourceLocation { req.location = capturedLoc }
+            }
+            placeholderId = req.placeholderForCreatedAsset?.localIdentifier ?? ""
+          }, completionHandler: { success, saveError in
+            cleanup()
+            self.endKeepAwakeAndBackgroundTask()
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000.0)
+            DispatchQueue.main.async {
+              if success {
+                result([
+                  "savedTarget": placeholderId,
+                  "outputSizeBytes": photoBytes,
+                  "elapsedMs": elapsedMs,
+                  "platformFormat": "JPEG 高清封面"
+                ])
+              } else {
+                result(FlutterError(code: "PHOTOS_SAVE_FAILED", message: "写入系统相册失败：\(saveError?.localizedDescription ?? "未知错误")", details: nil))
+              }
+            }
+          })
+          return
+        }
+
+        // Export standalone MP4 video
+        let outVideoURL = tempDir.appendingPathComponent("VID_Unclip_\(workId).MP4")
+        let trimRange = CMTimeRange(
+          start: CMTime(seconds: trimStartSec, preferredTimescale: 600),
+          duration: CMTime(seconds: trimDurationSec, preferredTimescale: 600)
+        )
+        self.emitProgress(stage: "video", progress: 0.12, message: "正在准备导出普通视频...")
+        self.buildPairedLiveVideo(
+          asset: asset,
+          trimRange: trimRange,
+          isTrimmed: isTrimmed,
+          trimStartSec: trimStartSec,
+          trimDurationSec: trimDurationSec,
+          stillImageTime: .zero,
+          assetIdentifier: nil,
+          quality: quality,
+          keepAudio: keepAudio,
+          playbackSpeed: playbackSpeed,
+          outputURL: outVideoURL
+        ) { [weak self] videoError, wasCancelled in
+          guard let self = self else {
+            try? FileManager.default.removeItem(at: tempDir)
+            return
+          }
+          if wasCancelled || self.checkCancelled() {
+            cleanup()
+            self.endKeepAwakeAndBackgroundTask()
+            DispatchQueue.main.async {
+              result(FlutterError(code: "CANCELLED", message: "已取消导出", details: nil))
+            }
+            return
+          }
+          if let videoError = videoError {
+            cleanup()
+            self.endKeepAwakeAndBackgroundTask()
+            DispatchQueue.main.async {
+              result(FlutterError(code: "VIDEO_EXPORT_FAILED", message: "导出普通视频失败：\(videoError.localizedDescription)", details: nil))
+            }
+            return
+          }
+
+          let videoBytes = (try? FileManager.default.attributesOfItem(atPath: outVideoURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+          self.emitProgress(stage: "saving", progress: 0.96, message: "正在写入 iPhone 系统“照片”...")
+          var placeholderId = ""
+          PHPhotoLibrary.shared().performChanges({
+            let req = PHAssetCreationRequest.forAsset()
+            let opts = PHAssetResourceCreationOptions()
+            opts.shouldMoveFile = true
+            req.addResource(with: .video, fileURL: outVideoURL, options: opts)
+            if preserveMetadata {
+              if let capturedAt = sourceDate { req.creationDate = capturedAt }
+              if let capturedLoc = sourceLocation { req.location = capturedLoc }
+            }
+            placeholderId = req.placeholderForCreatedAsset?.localIdentifier ?? ""
+          }, completionHandler: { success, saveError in
+            cleanup()
+            self.endKeepAwakeAndBackgroundTask()
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000.0)
+            DispatchQueue.main.async {
+              if success {
+                result([
+                  "savedTarget": placeholderId,
+                  "outputSizeBytes": videoBytes,
+                  "elapsedMs": elapsedMs,
+                  "platformFormat": "MP4 普通视频"
+                ])
+              } else {
+                result(FlutterError(code: "PHOTOS_SAVE_FAILED", message: "写入系统相册失败：\(saveError?.localizedDescription ?? "未知错误")", details: nil))
+              }
+            }
+          })
+        }
+      }
+    }
+  }
+
+  static func readStillImageTimeMs(from videoURL: URL) -> Int64 {
+    let asset = AVURLAsset(url: videoURL)
+    let durationMs = Int64(max(0.0, CMTimeGetSeconds(asset.duration) * 1000.0))
+    let fallbackMs: Int64 = durationMs > 600 ? 500 : 0
+
+    let metaTracks = asset.tracks(withMediaType: .metadata)
+    guard !metaTracks.isEmpty, let reader = try? AVAssetReader(asset: asset) else {
+      return fallbackMs
+    }
+    for track in metaTracks {
+      let trackOut = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+      guard reader.canAdd(trackOut) else { continue }
+      reader.add(trackOut)
+      let adaptor = AVAssetReaderOutputMetadataAdaptor(assetReaderTrackOutput: trackOut)
+      if reader.startReading() {
+        while let group = adaptor.nextTimedMetadataGroup() {
+          for item in group.items {
+            let keyStr = item.key as? String
+            if item.identifier?.rawValue == "mdta/com.apple.quicktime.still-image-time" ||
+                keyStr == "com.apple.quicktime.still-image-time" {
+              let sec = CMTimeGetSeconds(group.timeRange.start)
+              if sec.isFinite && sec >= 0 {
+                reader.cancelReading()
+                return Int64(sec * 1000.0)
+              }
+            }
+          }
+        }
+        reader.cancelReading()
+      }
+    }
+    return fallbackMs
+  }
+
+  static func normalizeImageToJpeg(sourceURL: URL, destURL: URL) -> Bool {
+    guard let src = CGImageSourceCreateWithURL(sourceURL as CFURL, nil) else { return false }
+    let opts: [CFString: Any] = [
+      kCGImageSourceCreateThumbnailFromImageAlways: true,
+      kCGImageSourceCreateThumbnailWithTransform: true,
+      kCGImageSourceThumbnailMaxPixelSize: 4096,
+      kCGImageSourceShouldCacheImmediately: true
+    ]
+    let cgImage = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
+      ?? CGImageSourceCreateImageAtIndex(src, 0, nil)
+    guard let image = cgImage,
+          let dest = CGImageDestinationCreateWithURL(destURL as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
+      return false
+    }
+    CGImageDestinationAddImage(dest, image, [kCGImageDestinationLossyCompressionQuality as String: 0.92] as CFDictionary)
+    return CGImageDestinationFinalize(dest)
+  }
+
+  static func unpackMotionPhotoJpeg(sourceURL: URL, outDir: URL, stamp: String) -> [String: Any]? {
+    guard let data = try? Data(contentsOf: sourceURL, options: .mappedIfSafe),
+          data.count >= 24,
+          data[0] == 0xFF, data[1] == 0xD8 else {
+      return nil
+    }
+
+    // Search for Motion Photo XMP or ftyp box after JPEG EOI
+    let ftypBytes = Data("ftyp".utf8)
+    let samsungMarker = Data("MotionPhoto_Data".utf8)
+    let xmpHeader = Data("http://ns.adobe.com/xap/1.0/\0".utf8)
+
+    var videoLength = 0
+    var presentationUs: Int64 = 0
+    var pos = 2
+    var xmpStart: Int?
+    var xmpEnd: Int?
+
+    while pos + 4 <= data.count {
+      if data[pos] != 0xFF { break }
+      let marker = data[pos + 1]
+      if marker == 0xDA || marker == 0xD9 { break }
+      if marker == 0xFF || marker == 0x00 {
+        pos += 1
+        continue
+      }
+      let segLen = (Int(data[pos + 2]) << 8) | Int(data[pos + 3])
+      if segLen < 2 || pos + 2 + segLen > data.count { break }
+      let segEnd = pos + 2 + segLen
+
+      if marker == 0xE1 && segLen >= 2 + xmpHeader.count {
+        let headerRange = (pos + 4)..<(pos + 4 + xmpHeader.count)
+        if data[headerRange] == xmpHeader {
+          let xmlData = data[(pos + 4 + xmpHeader.count)..<segEnd]
+          if let xml = String(data: xmlData, encoding: .utf8) {
+            if let lenRange = xml.range(of: #"Item:Length(?:\s*=\s*"(\d+)"|>\s*(\d+)\s*<)"#, options: .regularExpression) {
+              let digits = xml[lenRange].components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+              videoLength = Int(digits) ?? 0
+            }
+            if videoLength <= 0,
+               let microRange = xml.range(of: #"GCamera:MicroVideoOffset(?:\s*=\s*"(\d+)"|>\s*(\d+)\s*<)"#, options: .regularExpression) {
+              let digits = xml[microRange].components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+              videoLength = Int(digits) ?? 0
+            }
+            if let tsRange = xml.range(of: #"(?:MotionPhotoPresentationTimestampUs|MicroVideoPresentationTimestampUs)(?:\s*=\s*"(\d+)"|>\s*(\d+)\s*<)"#, options: .regularExpression) {
+              let digits = xml[tsRange].components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+              presentationUs = Int64(digits) ?? 0
+            }
+            if videoLength > 0 {
+              xmpStart = pos
+              xmpEnd = segEnd
+              break
+            }
+          }
+        }
+      }
+      pos = segEnd
+    }
+
+    func hasValidFtyp(at offset: Int) -> Bool {
+      guard offset >= 0, offset + 12 <= data.count else { return false }
+      guard data[(offset + 4)..<(offset + 8)] == ftypBytes else { return false }
+      let boxSize = (Int(data[offset]) << 24) | (Int(data[offset + 1]) << 16) | (Int(data[offset + 2]) << 8) | Int(data[offset + 3])
+      return boxSize >= 12 && boxSize <= 512 && offset + boxSize <= data.count
+    }
+
+    var mp4Start: Int?
+    var jpegEnd: Int?
+
+    if videoLength > 0 && videoLength < data.count - 24 {
+      let cand = data.count - videoLength
+      if hasValidFtyp(at: cand) {
+        mp4Start = cand
+        jpegEnd = cand
+      } else if cand + samsungMarker.count + 12 <= data.count,
+                data[cand..<(cand + samsungMarker.count)] == samsungMarker,
+                hasValidFtyp(at: cand + samsungMarker.count) {
+        mp4Start = cand + samsungMarker.count
+        jpegEnd = cand
+      }
+    }
+
+    if mp4Start == nil {
+      if let ftypRange = data.range(of: ftypBytes, options: .backwards),
+         ftypRange.lowerBound >= 8 {
+        let cand = ftypRange.lowerBound - 4
+        if hasValidFtyp(at: cand) {
+          mp4Start = cand
+          jpegEnd = cand
+          if cand >= samsungMarker.count,
+             data[(cand - samsungMarker.count)..<cand] == samsungMarker {
+            jpegEnd = cand - samsungMarker.count
+          }
+        }
+      }
+    }
+
+    guard let mStart = mp4Start, let jEnd = jpegEnd, jEnd >= 4, mStart < data.count else {
+      return nil
+    }
+
+    let outVideo = outDir.appendingPathComponent("unpacked_\(stamp).mp4")
+    let outCover = outDir.appendingPathComponent("unpacked_cover_\(stamp).jpg")
+    do {
+      try data[mStart..<data.count].write(to: outVideo)
+      if let xs = xmpStart, let xe = xmpEnd, xs < xe, xe <= jEnd {
+        var cleanJpeg = Data()
+        cleanJpeg.append(data[0..<xs])
+        cleanJpeg.append(data[xe..<jEnd])
+        try cleanJpeg.write(to: outCover)
+      } else {
+        try data[0..<jEnd].write(to: outCover)
+      }
+      var payload: [String: Any] = [
+        "videoPath": outVideo.path,
+        "coverTimeMs": max(Int64(0), presentationUs / 1000)
+      ]
+      if FileManager.default.fileExists(atPath: outCover.path) {
+        payload["coverImagePath"] = outCover.path
+      }
+      return payload
+    } catch {
+      return nil
     }
   }
 }

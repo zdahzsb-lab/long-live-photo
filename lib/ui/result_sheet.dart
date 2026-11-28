@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:material_ui/material_ui.dart';
 
@@ -5,18 +7,29 @@ import '../models/conversion_options.dart';
 import '../theme/ui_tokens.dart';
 import 'buttons.dart';
 
-/// Minimalist bottom sheet shown when Live Photo synthesis completes,
-/// keeping the primary dismissal action comfortably in the thumb zone.
-Future<void> showConversionResultSheet({
+enum ResultSheetAction {
+  done,
+  pickNext,
+}
+
+/// Minimalist bottom sheet shown when Live Photo or standalone media export completes,
+/// keeping primary and follow-up actions comfortably in the thumb zone.
+Future<ResultSheetAction?> showConversionResultSheet({
   required BuildContext context,
   required Duration duration,
   required ConversionResult result,
   PlaybackSpeedPreset playbackSpeed = PlaybackSpeedPreset.normal,
+  Future<void> Function()? onOpenGallery,
+  bool showPickNext = true,
+  bool showDurationMetric = true,
+  String title = '已存入系统相册',
+  String metricSizeLabel = '实况体积',
+  String hintText = '打开系统「照片 / 相册」，按住画面即可从头播放到尾。',
 }) {
   final elapsedSec = (result.elapsedMs / 1000).toStringAsFixed(1);
-  final hasSpeed = playbackSpeed.isModified;
+  final hasSpeed = showDurationMetric && playbackSpeed.isModified;
 
-  return showModalBottomSheet<void>(
+  return showModalBottomSheet<ResultSheetAction>(
     context: context,
     isScrollControlled: true,
     backgroundColor: Ui.surface,
@@ -47,8 +60,8 @@ Future<void> showConversionResultSheet({
                     ),
                   ),
                   const SizedBox(width: Ui.s3),
-                  const Expanded(
-                    child: Text('已存入系统相册', style: Ui.title),
+                  Expanded(
+                    child: Text(title, style: Ui.title),
                   ),
                   if (hasSpeed)
                     Container(
@@ -84,16 +97,18 @@ Future<void> showConversionResultSheet({
                 ),
                 child: Row(
                   children: <Widget>[
-                    Expanded(
-                      child: _MetricCell(
-                        label: hasSpeed ? '输出时长' : '完整时长',
-                        value: formatPreciseDuration(duration),
+                    if (showDurationMetric) ...<Widget>[
+                      Expanded(
+                        child: _MetricCell(
+                          label: hasSpeed ? '输出时长' : '完整时长',
+                          value: formatPreciseDuration(duration),
+                        ),
                       ),
-                    ),
-                    Container(width: 1, height: 28, color: Ui.hairline),
+                      Container(width: 1, height: 28, color: Ui.hairline),
+                    ],
                     Expanded(
                       child: _MetricCell(
-                        label: '实况体积',
+                        label: metricSizeLabel,
                         value: formatFileSize(result.outputSizeBytes),
                       ),
                     ),
@@ -108,15 +123,41 @@ Future<void> showConversionResultSheet({
                 ),
               ),
               const SizedBox(height: Ui.s4),
-              const Text(
-                '打开系统「照片 / 相册」，按住画面即可从头播放到尾。',
-                style: Ui.body,
-              ),
+              Text(hintText, style: Ui.body),
               const SizedBox(height: Ui.s5),
+              if (onOpenGallery != null || showPickNext) ...<Widget>[
+                Row(
+                  children: <Widget>[
+                    if (onOpenGallery != null)
+                      Expanded(
+                        child: SecondaryButton(
+                          key: const Key('result_open_gallery_button'),
+                          label: '打开相册',
+                          icon: LucideIcons.images,
+                          onTap: () => unawaited(onOpenGallery()),
+                        ),
+                      ),
+                    if (onOpenGallery != null && showPickNext)
+                      const SizedBox(width: Ui.s2),
+                    if (showPickNext)
+                      Expanded(
+                        child: SecondaryButton(
+                          key: const Key('result_pick_next_button'),
+                          label: '再选一段',
+                          icon: LucideIcons.plus,
+                          onTap: () => Navigator.of(sheetContext)
+                              .pop(ResultSheetAction.pickNext),
+                        ),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: Ui.s2 + 2),
+              ],
               PrimaryButton(
                 key: const Key('result_done_button'),
                 label: '完成',
-                onTap: () => Navigator.of(sheetContext).pop(),
+                onTap: () =>
+                    Navigator.of(sheetContext).pop(ResultSheetAction.done),
               ),
             ],
           ),

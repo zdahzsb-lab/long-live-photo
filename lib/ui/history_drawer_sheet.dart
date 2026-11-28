@@ -320,7 +320,9 @@ class _HistoryEntryTile extends StatelessWidget {
                       mainAxisSize: MainAxisSize.min,
                       children: <Widget>[
                         Text(
-                          '${formatPreciseDuration(entry.outputDuration)} · ${formatFileSize(entry.outputSizeBytes)} · ${entry.quality.shortLabel}',
+                          entry.outputDurationMs > 0
+                              ? '${formatPreciseDuration(entry.outputDuration)} · ${formatFileSize(entry.outputSizeBytes)} · ${entry.quality.shortLabel}'
+                              : '批量合成 · ${formatFileSize(entry.outputSizeBytes)} · ${entry.quality.shortLabel}',
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: Ui.mono.copyWith(fontSize: 13),

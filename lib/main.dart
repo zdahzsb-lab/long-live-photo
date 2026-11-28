@@ -10,11 +10,13 @@ import 'package:material_ui/material_ui.dart';
 import 'package:video_player/video_player.dart';
 
 import 'constants/app_branding.dart';
+import 'models/batch_task.dart';
 import 'models/conversion_history.dart';
 import 'models/conversion_options.dart';
 import 'services/conversion_history_store.dart';
 import 'services/live_photo_channel.dart';
 import 'theme/ui_tokens.dart';
+import 'ui/batch_queue_sheet.dart';
 import 'ui/buttons.dart';
 import 'ui/history_drawer_sheet.dart';
 import 'ui/pressable.dart';
@@ -48,6 +50,8 @@ class LongLivePhotoApp extends StatelessWidget {
     this.debugInitialSizeBytes = 0,
     this.debugInitialCustomCoverPath,
     this.debugFileExistsChecker,
+    this.debugControllerBuilder,
+    this.debugFileSizeReader,
   });
 
   final LivePhotoConverterGateway? gateway;
@@ -57,6 +61,8 @@ class LongLivePhotoApp extends StatelessWidget {
   final int debugInitialSizeBytes;
   final String? debugInitialCustomCoverPath;
   final Future<bool> Function(String path)? debugFileExistsChecker;
+  final VideoPlayerController Function(String path)? debugControllerBuilder;
+  final Future<int> Function(String path)? debugFileSizeReader;
 
   @override
   Widget build(BuildContext context) {
@@ -79,6 +85,8 @@ class LongLivePhotoApp extends StatelessWidget {
         initialSizeBytes: debugInitialSizeBytes,
         initialCustomCoverPath: debugInitialCustomCoverPath,
         fileExistsChecker: debugFileExistsChecker,
+        controllerBuilder: debugControllerBuilder,
+        fileSizeReader: debugFileSizeReader,
       ),
     );
   }
@@ -94,6 +102,8 @@ class ConverterHomePage extends StatefulWidget {
     this.initialSizeBytes = 0,
     this.initialCustomCoverPath,
     this.fileExistsChecker,
+    this.controllerBuilder,
+    this.fileSizeReader,
   });
 
   final LivePhotoConverterGateway gateway;
@@ -103,6 +113,8 @@ class ConverterHomePage extends StatefulWidget {
   final int initialSizeBytes;
   final String? initialCustomCoverPath;
   final Future<bool> Function(String path)? fileExistsChecker;
+  final VideoPlayerController Function(String path)? controllerBuilder;
+  final Future<int> Function(String path)? fileSizeReader;
 
   @override
   State<ConverterHomePage> createState() => _ConverterHomePageState();
@@ -118,6 +130,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
   VideoPlayerController? _videoController;
   bool _ownsController = false;
   StreamSubscription<ConversionProgress>? _progressSub;
+  StreamSubscription<List<SharedMediaItem>>? _sharedMediaSub;
 
   String? _selectedVideoPath;
   String? _customCoverPath;
@@ -167,10 +180,20 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
         setState(() => _progress = ev);
       }
     });
+
+    _sharedMediaSub =
+        widget.gateway.sharedMediaStream.listen((List<SharedMediaItem> items) {
+      unawaited(_handleIncomingSharedMedia(items));
+    });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_consumeInitialSharedMedia());
+    });
   }
 
   @override
   void dispose() {
+    _sharedMediaSub?.cancel();
     _progressSub?.cancel();
     _videoController?.removeListener(_onVideoTick);
     if (_ownsController) {
@@ -248,16 +271,156 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     }
   }
 
+  Future<void> _consumeInitialSharedMedia() async {
+    final items = await widget.gateway.consumeInitialSharedMedia();
+    if (!mounted || items.isEmpty) return;
+    await _handleIncomingSharedMedia(items);
+  }
+
+  Future<void> _handleIncomingSharedMedia(List<SharedMediaItem> items) async {
+    final valid = items
+        .where((SharedMediaItem e) => e.path.isNotEmpty)
+        .toList(growable: false);
+    if (valid.isEmpty || !mounted) return;
+    if (_isConverting) {
+      _showMessage('正在合成中，请稍后再导入分享素材');
+      return;
+    }
+
+    final videos = valid
+        .where((SharedMediaItem e) => e.kind == SharedMediaKind.video)
+        .toList(growable: false);
+    final images = valid
+        .where((SharedMediaItem e) => e.kind == SharedMediaKind.image)
+        .toList(growable: false);
+
+    if (videos.length >= 2) {
+      await _openBatchSheetFromPaths(
+        videos.map((SharedMediaItem e) => e.path).toList(growable: false),
+      );
+      return;
+    }
+    if (videos.length == 1) {
+      await _loadVideoFile(videos.first.path);
+      return;
+    }
+    if (images.isNotEmpty) {
+      await _unpackAndLoadFile(images.first.path);
+    }
+  }
+
+  Future<void> _pickBatchVideos() async {
+    if (_isConverting) return;
+    try {
+      final List<XFile> picked = await _imagePicker.pickMultiVideo();
+      if (picked.isEmpty || !mounted) return;
+      if (picked.length == 1) {
+        await _loadVideoFile(picked.first.path);
+        return;
+      }
+      await _openBatchSheetFromPaths(
+        picked.map((XFile f) => f.path).toList(growable: false),
+      );
+    } on PlatformException catch (e) {
+      _showMessage('批量选片失败：${e.message ?? e.code}');
+    } catch (e) {
+      _showMessage('批量选片失败：$e');
+    }
+  }
+
+  Future<void> _openBatchSheetFromPaths(List<String> paths) async {
+    if (paths.isEmpty || !mounted) return;
+    final items = <BatchQueueItem>[];
+    for (int i = 0; i < paths.length; i++) {
+      final path = paths[i];
+      if (path.isEmpty) continue;
+      final sizeBytes = await _readFileSizeSafe(path);
+      final name = _fileBasename(path, fallbackIndex: i + 1);
+      items.add(
+        BatchQueueItem(
+          id: '${i}_${DateTime.now().microsecondsSinceEpoch}',
+          videoPath: path,
+          displayName: name,
+          sourceSizeBytes: sizeBytes,
+        ),
+      );
+    }
+    if (!mounted || items.isEmpty) return;
+
+    await showBatchQueueSheet(
+      context: context,
+      initialItems: items,
+      gateway: widget.gateway,
+      historyStore: _historyStore,
+      initialQuality: _quality,
+      initialSpeed: _playbackSpeed,
+      initialKeepAudio: _keepAudio,
+      initialPreserveMetadata: _preserveMetadata,
+      onHistoryUpdated: (List<ConversionHistoryEntry> updated) {
+        if (mounted) {
+          setState(() => _historyEntries = updated);
+        }
+      },
+      onOpenGallery: (String? savedTarget) =>
+          widget.gateway.openSystemGallery(savedTarget: savedTarget),
+    );
+  }
+
+  Future<void> _pickAndUnpackLivePhoto() async {
+    if (_isConverting) return;
+    try {
+      final unpacked = await widget.gateway.pickAndUnpackLivePhoto();
+      if (unpacked == null || !mounted) return;
+      await _loadVideoFile(
+        unpacked.videoPath,
+        initialCoverTimeMs: unpacked.coverTimeMs,
+        customToast: '已拆解实况照片，可二次编辑或点右上角导出',
+      );
+    } on PlatformException catch (e) {
+      if (e.code != 'CANCELLED') {
+        _showMessage(e.message ?? '拆解实况失败（${e.code}）');
+      }
+    } catch (e) {
+      _showMessage('拆解实况失败：$e');
+    }
+  }
+
+  Future<void> _unpackAndLoadFile(String filePath) async {
+    if (_isConverting) return;
+    setState(() => _isLoadingVideo = true);
+    try {
+      final unpacked =
+          await widget.gateway.unpackLivePhotoFile(filePath: filePath);
+      if (!mounted) return;
+      await _loadVideoFile(
+        unpacked.videoPath,
+        initialCoverTimeMs: unpacked.coverTimeMs,
+        customToast: '已拆解实况照片，可二次编辑或点右上角导出',
+      );
+    } on PlatformException catch (e) {
+      if (mounted) {
+        setState(() => _isLoadingVideo = false);
+        _showMessage(e.message ?? '该图片不包含实况视频轨道');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _isLoadingVideo = false);
+        _showMessage('拆解实况失败：$e');
+      }
+    }
+  }
+
   Future<void> _openSourceSheet() async {
     if (_isConverting) return;
     final String? choice = await showModalBottomSheet<String>(
       context: context,
+      isScrollControlled: true,
       backgroundColor: Ui.surface,
       barrierColor: const Color(0xA6000000),
       builder: (BuildContext sheetContext) {
         return SafeArea(
           top: false,
-          child: Padding(
+          child: SingleChildScrollView(
             padding: const EdgeInsets.fromLTRB(Ui.s5, Ui.s1, Ui.s5, Ui.s5),
             child: Column(
               mainAxisSize: MainAxisSize.min,
@@ -279,6 +442,20 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
                 ),
                 const SizedBox(height: Ui.s2 + 2),
                 SecondaryButton(
+                  key: const Key('sheet_pick_batch'),
+                  label: '批量多选转换',
+                  icon: LucideIcons.layers,
+                  onTap: () => Navigator.of(sheetContext).pop('batch'),
+                ),
+                const SizedBox(height: Ui.s2 + 2),
+                SecondaryButton(
+                  key: const Key('sheet_pick_live_unpack'),
+                  label: '导入实况照片（拆解 / 重编）',
+                  icon: LucideIcons.sparkles,
+                  onTap: () => Navigator.of(sheetContext).pop('unpack'),
+                ),
+                const SizedBox(height: Ui.s2 + 2),
+                SecondaryButton(
                   key: const Key('sheet_pick_files'),
                   label: '从文件管理器导入',
                   icon: LucideIcons.folderOpen,
@@ -294,8 +471,157 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     if (!mounted || choice == null) return;
     if (choice == 'gallery') {
       await _pickFromGallery();
+    } else if (choice == 'batch') {
+      await _pickBatchVideos();
+    } else if (choice == 'unpack') {
+      await _pickAndUnpackLivePhoto();
     } else if (choice == 'files') {
       await _pickFromFiles();
+    }
+  }
+
+  Future<void> _openExportToolsSheet() async {
+    if (_isConverting || _selectedVideoPath == null) return;
+    final StandaloneExportMode? mode =
+        await showModalBottomSheet<StandaloneExportMode>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Ui.surface,
+      barrierColor: const Color(0xA6000000),
+      builder: (BuildContext sheetContext) {
+        return SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(Ui.s5, Ui.s1, Ui.s5, Ui.s5),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                const Padding(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: Ui.s1,
+                    vertical: Ui.s2,
+                  ),
+                  child: Text('导出独立素材', style: Ui.title),
+                ),
+                const SizedBox(height: Ui.s2),
+                SecondaryButton(
+                  key: const Key('sheet_export_video'),
+                  label: '导出为普通视频（MP4）',
+                  icon: LucideIcons.film,
+                  onTap: () => Navigator.of(sheetContext)
+                      .pop(StandaloneExportMode.video),
+                ),
+                const SizedBox(height: Ui.s2 + 2),
+                SecondaryButton(
+                  key: const Key('sheet_export_cover'),
+                  label: '提取当前高清封面（JPG）',
+                  icon: LucideIcons.image,
+                  onTap: () => Navigator.of(sheetContext)
+                      .pop(StandaloneExportMode.cover),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+
+    if (!mounted || mode == null) return;
+    await _startStandaloneExport(mode);
+  }
+
+  Future<void> _startStandaloneExport(StandaloneExportMode mode) async {
+    final path = _selectedVideoPath;
+    if (path == null || _isConverting) return;
+
+    final ctrl = _videoController;
+    if (ctrl != null && ctrl.value.isPlaying) {
+      await ctrl.pause();
+    }
+
+    final totalMs = _videoDuration.inMilliseconds;
+    final isTrimmed = VideoTrimMath.isEffectivelyTrimmed(
+      startMs: _trimStartMs,
+      endMs: _trimEndMs,
+      totalMs: totalMs,
+    );
+    final effectiveDuration = isTrimmed
+        ? Duration(milliseconds: (_trimEndMs - _trimStartMs).clamp(0, totalMs))
+        : _videoDuration;
+    final speed = _playbackSpeed;
+    final outputDuration = VideoSpeedMath.scaledDuration(
+      effectiveDuration,
+      speed.rate,
+    );
+
+    setState(() {
+      _isConverting = true;
+      _isLiveHolding = false;
+      _progress = ConversionProgress(
+        stage: mode == StandaloneExportMode.cover ? 'cover' : 'video',
+        progress: 0.08,
+        message: mode == StandaloneExportMode.cover
+            ? '正在提取高清封面...'
+            : '正在准备导出视频...',
+      );
+    });
+
+    try {
+      final result = await widget.gateway.exportStandaloneMedia(
+        mode: mode,
+        videoPath: path,
+        coverTimeMs: _coverTimeMs,
+        quality: _quality,
+        keepAudio: _keepAudio,
+        customCoverPath: _customCoverPath,
+        trimStartMs: isTrimmed ? _trimStartMs : null,
+        trimEndMs: isTrimmed ? _trimEndMs : null,
+        preserveMetadata: _preserveMetadata,
+        playbackSpeed: speed.rate,
+      );
+
+      if (!mounted) return;
+      playHaptic(Haptic.medium);
+      setState(() {
+        _isConverting = false;
+        _progress = null;
+      });
+
+      final isCover = mode == StandaloneExportMode.cover;
+      await showConversionResultSheet(
+        context: context,
+        duration: outputDuration,
+        result: result,
+        playbackSpeed: isCover ? PlaybackSpeedPreset.normal : speed,
+        showPickNext: false,
+        showDurationMetric: !isCover,
+        title: isCover ? '封面已存入相册' : '视频已存入相册',
+        metricSizeLabel: isCover ? '图片体积' : '视频体积',
+        hintText: isCover
+            ? '已将当前高清静态封面保存至系统相册。'
+            : '已按当前裁剪与倍速参数导出普通视频至系统相册。',
+        onOpenGallery: () =>
+            widget.gateway.openSystemGallery(savedTarget: result.savedTarget),
+      );
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isConverting = false;
+        _progress = null;
+      });
+      if (e.code == 'CANCELLED') {
+        _showMessage('已取消导出', isError: false);
+      } else {
+        _showMessage(e.message ?? '导出失败（${e.code}）');
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isConverting = false;
+        _progress = null;
+      });
+      _showMessage('导出出错：$e');
     }
   }
 
@@ -386,6 +712,29 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     return File(path).exists();
   }
 
+  Future<int> _readFileSizeSafe(String path) async {
+    final reader = widget.fileSizeReader;
+    if (reader != null) {
+      return reader(path);
+    }
+    try {
+      final f = File(path);
+      if (await f.exists()) {
+        return await f.length();
+      }
+    } catch (_) {
+      // Ignore missing or mock paths.
+    }
+    return 0;
+  }
+
+  String _fileBasename(String path, {required int fallbackIndex}) {
+    final normalized = path.replaceAll('\\', '/');
+    final idx = normalized.lastIndexOf('/');
+    final base = idx >= 0 ? normalized.substring(idx + 1) : normalized;
+    return base.isEmpty ? '视频 $fallbackIndex' : base;
+  }
+
   Future<void> _applyPlaybackSpeed(double rate) async {
     final ctrl = _videoController;
     if (ctrl == null) return;
@@ -426,11 +775,48 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     );
   }
 
+  Future<String?> _resolveSurvivingCustomCover(
+    ConversionHistoryEntry entry,
+  ) async {
+    if (!entry.usedCustomCover) return null;
+    for (final candidate in <String?>[
+      entry.customCoverPath,
+      entry.thumbnailPath,
+    ]) {
+      if (candidate != null &&
+          candidate.isNotEmpty &&
+          await _checkFileExists(candidate)) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
   Future<void> _restoreFromHistoryEntry(ConversionHistoryEntry entry) async {
     if (_isConverting) return;
     final videoExists = await _checkFileExists(entry.sourceVideoPath);
     if (!mounted) return;
     if (!videoExists) {
+      final activeCtrl = _videoController;
+      if (activeCtrl != null && activeCtrl.value.isInitialized) {
+        final restoredSpeed = entry.speedPreset;
+        final restoredAudio = entry.keepAudio;
+        final survivingCover = await _resolveSurvivingCustomCover(entry);
+        final restoredCustomCover = survivingCover ?? _customCoverPath;
+        if (!mounted) return;
+        await activeCtrl.setVolume(restoredAudio ? 1.0 : 0.0);
+        await _applyPlaybackSpeed(restoredSpeed.rate);
+        if (!mounted) return;
+        setState(() {
+          _quality = entry.quality;
+          _playbackSpeed = restoredSpeed;
+          _keepAudio = restoredAudio;
+          _preserveMetadata = entry.preserveMetadata;
+          _customCoverPath = restoredCustomCover;
+        });
+        _showMessage('原视频已移除，已将参数套用到当前视频', isError: false);
+        return;
+      }
       _showMessage('原视频文件已移除，无法重新载入');
       return;
     }
@@ -452,12 +838,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
         startMs: restoredRange.startMs,
         endMs: restoredRange.endMs,
       );
-      String? restoredCustomCover;
-      if (entry.customCoverPath != null && entry.customCoverPath!.isNotEmpty) {
-        if (await _checkFileExists(entry.customCoverPath!)) {
-          restoredCustomCover = entry.customCoverPath;
-        }
-      }
+      final restoredCustomCover = await _resolveSurvivingCustomCover(entry);
       if (!mounted) return;
 
       final restoredSpeed = entry.speedPreset;
@@ -491,6 +872,8 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
   Future<void> _loadVideoFile(
     String path, {
     ConversionHistoryEntry? restoredEntry,
+    int? initialCoverTimeMs,
+    String? customToast,
   }) async {
     setState(() {
       _isLoadingVideo = true;
@@ -502,10 +885,15 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     oldController?.removeListener(_onVideoTick);
 
     try {
-      final file = File(path);
-      final size = await file.length();
-      final ctrl = VideoPlayerController.file(file);
-      await ctrl.initialize();
+      final size = await _readFileSizeSafe(path);
+      final customBuilder = widget.controllerBuilder;
+      final bool ownsNewController = customBuilder == null;
+      final ctrl = customBuilder != null
+          ? customBuilder(path)
+          : VideoPlayerController.file(File(path));
+      if (!ctrl.value.isInitialized) {
+        await ctrl.initialize();
+      }
 
       final totalMs = ctrl.value.duration.inMilliseconds;
       final restoredSpeed =
@@ -530,15 +918,17 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
               startMs: trimRange.startMs,
               endMs: trimRange.endMs,
             )
-          : defaultCoverMs;
+          : (initialCoverTimeMs != null
+              ? VideoTrimMath.clampCoverToTrim(
+                  coverMs: initialCoverTimeMs,
+                  startMs: trimRange.startMs,
+                  endMs: trimRange.endMs,
+                )
+              : defaultCoverMs);
 
-      String? restoredCustomCover;
-      if (restoredEntry?.customCoverPath != null &&
-          restoredEntry!.customCoverPath!.isNotEmpty) {
-        if (await _checkFileExists(restoredEntry.customCoverPath!)) {
-          restoredCustomCover = restoredEntry.customCoverPath;
-        }
-      }
+      final restoredCustomCover = restoredEntry != null
+          ? await _resolveSurvivingCustomCover(restoredEntry)
+          : null;
 
       await ctrl.setVolume(restoredAudio ? 1.0 : 0.0);
       try {
@@ -551,14 +941,16 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
       }
 
       if (!mounted) {
-        await ctrl.dispose();
+        if (ownsNewController) {
+          await ctrl.dispose();
+        }
         return;
       }
 
       ctrl.addListener(_onVideoTick);
       setState(() {
         _videoController = ctrl;
-        _ownsController = true;
+        _ownsController = ownsNewController;
         _selectedVideoPath = path;
         _customCoverPath = restoredCustomCover;
         _sourceSizeBytes = size;
@@ -575,7 +967,9 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
         _isLoadingVideo = false;
       });
 
-      if (restoredEntry != null) {
+      if (customToast != null) {
+        _showMessage(customToast, isError: false);
+      } else if (restoredEntry != null) {
         _showMessage('已载入历史素材与参数', isError: false);
       }
 
@@ -807,6 +1201,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
         final updated = await _historyStore.add(
           entry,
           thumbnailBytes: thumbBytes,
+          customCoverSourcePath: _customCoverPath,
         );
         if (mounted) {
           setState(() => _historyEntries = updated);
@@ -816,12 +1211,18 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
       }
 
       if (!mounted) return;
-      await showConversionResultSheet(
+      final action = await showConversionResultSheet(
         context: context,
         duration: outputDuration,
         result: result,
         playbackSpeed: speed,
+        showPickNext: true,
+        onOpenGallery: () =>
+            widget.gateway.openSystemGallery(savedTarget: result.savedTarget),
       );
+      if (mounted && action == ResultSheetAction.pickNext) {
+        unawaited(_pickFromGallery());
+      }
     } on PlatformException catch (e) {
       if (!mounted) return;
       setState(() {
@@ -865,29 +1266,44 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
                     height: 44,
                     child: Row(
                       children: <Widget>[
-                        const Text(AppBranding.appName, style: Ui.wordmark),
-                        const SizedBox(width: Ui.s2),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 7,
-                            vertical: 2,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Ui.surface,
-                            borderRadius: BorderRadius.circular(6),
-                            border: Border.all(color: Ui.hairline),
-                          ),
-                          child: Text(
-                            'LIVE',
-                            style: Ui.mono.copyWith(
-                              fontSize: 10.5,
-                              letterSpacing: 0.6,
-                              color: Ui.textSecondary,
-                            ),
+                        Expanded(
+                          child: Row(
+                            children: <Widget>[
+                              const Flexible(
+                                child: Text(
+                                  AppBranding.appName,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: Ui.wordmark,
+                                ),
+                              ),
+                              if (!hasVideo && scaledPx <= 16.0) ...<Widget>[
+                                const SizedBox(width: Ui.s2),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 7,
+                                    vertical: 2,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: Ui.surface,
+                                    borderRadius: BorderRadius.circular(6),
+                                    border: Border.all(color: Ui.hairline),
+                                  ),
+                                  child: Text(
+                                    'LIVE',
+                                    style: Ui.mono.copyWith(
+                                      fontSize: 10.5,
+                                      letterSpacing: 0.6,
+                                      color: Ui.textSecondary,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ],
                           ),
                         ),
-                        const Spacer(),
-                        if (hasVideo && scaledPx > 18.0) ...<Widget>[
+                        const SizedBox(width: Ui.s2),
+                        if (hasVideo && scaledPx > 15.5) ...<Widget>[
                           IconAction(
                             key: const Key('history_drawer_button'),
                             icon: LucideIcons.history,
@@ -897,7 +1313,17 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
                             enabled: !_isConverting,
                             onTap: _openHistoryDrawer,
                           ),
-                          const SizedBox(width: 6),
+                          const SizedBox(width: 4),
+                          IconAction(
+                            key: const Key('export_tools_button'),
+                            icon: LucideIcons.share,
+                            filled: true,
+                            size: 17,
+                            semanticLabel: '导出纯视频或高清封面',
+                            enabled: !_isConverting,
+                            onTap: _openExportToolsSheet,
+                          ),
+                          const SizedBox(width: 4),
                           IconAction(
                             key: const Key('replace_video_button'),
                             icon: LucideIcons.arrowLeftRight,
@@ -920,7 +1346,17 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
                             onTap: _openHistoryDrawer,
                           ),
                           if (hasVideo) ...<Widget>[
-                            const SizedBox(width: 6),
+                            const SizedBox(width: 4),
+                            IconAction(
+                              key: const Key('export_tools_button'),
+                              icon: LucideIcons.share,
+                              filled: true,
+                              size: 17,
+                              semanticLabel: '导出纯视频或高清封面',
+                              enabled: !_isConverting,
+                              onTap: _openExportToolsSheet,
+                            ),
+                            const SizedBox(width: 4),
                             PillAction(
                               key: const Key('replace_video_button'),
                               label: '更换',
@@ -1012,6 +1448,8 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
           isBusy: _isConverting,
           onPickGallery: _pickFromGallery,
           onPickFiles: _pickFromFiles,
+          onPickBatch: _pickBatchVideos,
+          onPickLiveUnpack: _pickAndUnpackLivePhoto,
         ),
       );
     }

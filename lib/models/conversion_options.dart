@@ -269,6 +269,58 @@ class ConversionResult {
   final String platformFormat;
 }
 
+enum StandaloneExportMode {
+  video(wireValue: 'video'),
+  cover(wireValue: 'cover');
+
+  const StandaloneExportMode({required this.wireValue});
+
+  final String wireValue;
+}
+
+enum SharedMediaKind { video, image }
+
+class SharedMediaItem {
+  const SharedMediaItem({
+    required this.path,
+    required this.kind,
+  });
+
+  factory SharedMediaItem.fromMap(Map<Object?, Object?> map) {
+    final rawKind = (map['kind'] as String?) ?? 'video';
+    return SharedMediaItem(
+      path: (map['path'] as String?) ?? '',
+      kind: rawKind == 'image' ? SharedMediaKind.image : SharedMediaKind.video,
+    );
+  }
+
+  final String path;
+  final SharedMediaKind kind;
+}
+
+class UnpackedLivePhoto {
+  const UnpackedLivePhoto({
+    required this.videoPath,
+    this.coverImagePath,
+    this.coverTimeMs = 0,
+  });
+
+  factory UnpackedLivePhoto.fromMap(Map<Object?, Object?> map) {
+    final rawCoverMs = map['coverTimeMs'];
+    final coverPath = map['coverImagePath'] as String?;
+    return UnpackedLivePhoto(
+      videoPath: (map['videoPath'] as String?) ?? '',
+      coverImagePath:
+          (coverPath != null && coverPath.isNotEmpty) ? coverPath : null,
+      coverTimeMs: rawCoverMs is num ? rawCoverMs.toInt().clamp(0, 1 << 30) : 0,
+    );
+  }
+
+  final String videoPath;
+  final String? coverImagePath;
+  final int coverTimeMs;
+}
+
 String formatPreciseDuration(Duration d) {
   final totalMs = d.inMilliseconds < 0 ? 0 : d.inMilliseconds;
   final hours = totalMs ~/ 3600000;

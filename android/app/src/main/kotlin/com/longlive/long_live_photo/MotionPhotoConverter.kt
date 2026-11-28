@@ -30,6 +30,7 @@ import androidx.media3.effect.SpeedChangeEffect
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.DefaultEncoderFactory
 import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.EditedMediaItemSequence
 import androidx.media3.transformer.Effects
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
@@ -39,7 +40,10 @@ import androidx.media3.transformer.VideoEncoderSettings
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -59,6 +63,12 @@ data class NativeConversionOutcome(
     val savedUri: String,
     val outputSizeBytes: Long,
     val elapsedMs: Long,
+)
+
+data class NativeUnpackedLivePhoto(
+    val videoPath: String,
+    val coverImagePath: String?,
+    val coverTimeMs: Long,
 )
 
 @OptIn(UnstableApi::class)
@@ -160,6 +170,7 @@ class MotionPhotoConverter(
                     trimEndMs = inspection.safeTrimEndMs,
                     isTrimmed = inspection.isTrimmed,
                     hasAudioTrack = inspection.hasAudioTrack,
+                    isHdr = inspection.isHdr,
                     quality = quality,
                     keepAudio = keepAudio,
                     playbackSpeed = safeSpeed,
@@ -244,10 +255,54 @@ class MotionPhotoConverter(
         val safeTrimEndMs: Long,
         val isTrimmed: Boolean,
         val hasAudioTrack: Boolean,
+        val isHdr: Boolean,
         val clampedCoverMs: Long,
         val captureTimeMs: Long?,
         val location: Pair<Double, Double>?,
     )
+
+    private fun detectIsHdrVideo(
+        inputFile: File,
+        retriever: MediaMetadataRetriever,
+    ): Boolean {
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(inputFile.absolutePath)
+            for (i in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+                if (!mime.startsWith("video/")) continue
+                if (mime == MimeTypes.VIDEO_DOLBY_VISION) return true
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
+                    format.containsKey(MediaFormat.KEY_COLOR_TRANSFER)
+                ) {
+                    val transfer = format.getInteger(MediaFormat.KEY_COLOR_TRANSFER)
+                    if (transfer == MediaFormat.COLOR_TRANSFER_ST2084 ||
+                        transfer == MediaFormat.COLOR_TRANSFER_HLG
+                    ) {
+                        return true
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        } finally {
+            try {
+                extractor.release()
+            } catch (_: Exception) {
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val transferMeta = retriever
+                .extractMetadata(MediaMetadataRetriever.METADATA_KEY_COLOR_TRANSFER)
+                ?.toIntOrNull()
+            if (transferMeta == MediaFormat.COLOR_TRANSFER_ST2084 ||
+                transferMeta == MediaFormat.COLOR_TRANSFER_HLG
+            ) {
+                return true
+            }
+        }
+        return false
+    }
 
     private fun detectHasAudioTrack(
         inputFile: File,
@@ -293,6 +348,7 @@ class MotionPhotoConverter(
             val durationMs = (retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                 ?.toLongOrNull() ?: 1000L).coerceAtLeast(100L)
             val hasAudioTrack = detectHasAudioTrack(inputFile, retriever)
+            val isHdr = detectIsHdrVideo(inputFile, retriever)
 
             val rawStart = (trimStartMs ?: 0L).coerceIn(0L, max(0L, durationMs - 100L))
             var rawEnd = (trimEndMs ?: durationMs).coerceIn(100L, durationMs)
@@ -334,6 +390,7 @@ class MotionPhotoConverter(
                 safeTrimEndMs = safeTrimEndMs,
                 isTrimmed = isTrimmed,
                 hasAudioTrack = hasAudioTrack,
+                isHdr = isHdr,
                 clampedCoverMs = clampedCoverMs,
                 captureTimeMs = captureTimeMs,
                 location = location,
@@ -581,6 +638,7 @@ class MotionPhotoConverter(
         trimEndMs: Long,
         isTrimmed: Boolean,
         hasAudioTrack: Boolean,
+        isHdr: Boolean,
         quality: String,
         keepAudio: Boolean,
         playbackSpeed: Double,
@@ -607,6 +665,7 @@ class MotionPhotoConverter(
             trimEndMs = trimEndMs,
             isTrimmed = isTrimmed,
             hasAudioTrack = hasAudioTrack,
+            isHdr = isHdr,
             quality = quality,
             keepAudio = keepAudio,
             playbackSpeed = safeSpeed,
@@ -731,6 +790,7 @@ class MotionPhotoConverter(
         trimEndMs: Long,
         isTrimmed: Boolean,
         hasAudioTrack: Boolean,
+        isHdr: Boolean,
         quality: String,
         keepAudio: Boolean,
         playbackSpeed: Double,
@@ -855,8 +915,20 @@ class MotionPhotoConverter(
                     })
                     .build()
 
+                val sequence = if (keepActualAudio) {
+                    EditedMediaItemSequence.withAudioAndVideoFrom(listOf(editedItem))
+                } else {
+                    EditedMediaItemSequence.withVideoFrom(listOf(editedItem))
+                }
+                val compositionBuilder = Composition.Builder(listOf(sequence))
+                if (isHdr && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    compositionBuilder.setHdrMode(
+                        Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL
+                    )
+                }
+
                 activeTransformer = transformer
-                transformer.start(editedItem, outputFile.absolutePath)
+                transformer.start(compositionBuilder.build(), outputFile.absolutePath)
                 mainHandler.postDelayed(pollRunnable, 200L)
             } catch (e: Exception) {
                 activeTransformer = null
@@ -877,39 +949,62 @@ class MotionPhotoConverter(
         mp4File: File,
         captureTimeMs: Long?,
     ): Uri {
-        val resolver = context.contentResolver
         val fileDateMs = captureTimeMs ?: System.currentTimeMillis()
         val timestampStr = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date(fileDateMs))
-        val displayName = "MVIMG_$timestampStr.jpg"
+        return writeMediaToMediaStore(
+            contentUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            displayName = "MVIMG_$timestampStr.jpg",
+            mimeType = "image/jpeg",
+            dateTakenKey = MediaStore.Images.Media.DATE_TAKEN,
+            captureTimeMs = captureTimeMs,
+            prefixBytes = xmpJpegBytes,
+            bodyFile = mp4File,
+        )
+    }
 
+    private fun writeMediaToMediaStore(
+        contentUri: Uri,
+        displayName: String,
+        mimeType: String,
+        dateTakenKey: String,
+        captureTimeMs: Long?,
+        prefixBytes: ByteArray?,
+        bodyFile: File?,
+    ): Uri {
+        val resolver = context.contentResolver
+        val fileDateMs = captureTimeMs ?: System.currentTimeMillis()
         val values = ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
-            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+            put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
             val timeSec = fileDateMs / 1000L
-            put(MediaStore.Images.Media.DATE_ADDED, timeSec)
-            put(MediaStore.Images.Media.DATE_MODIFIED, timeSec)
+            put(MediaStore.MediaColumns.DATE_ADDED, timeSec)
+            put(MediaStore.MediaColumns.DATE_MODIFIED, timeSec)
             if (captureTimeMs != null) {
-                put(MediaStore.Images.Media.DATE_TAKEN, captureTimeMs)
+                put(dateTakenKey, captureTimeMs)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/Camera")
-                put(MediaStore.Images.Media.IS_PENDING, 1)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/Camera")
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
             }
         }
 
-        val itemUri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-            ?: throw IllegalStateException("无法在系统相册中创建实况文件条目")
+        val itemUri = resolver.insert(contentUri, values)
+            ?: throw IllegalStateException("无法在系统相册中创建文件条目")
 
         try {
             resolver.openOutputStream(itemUri)?.use { out ->
-                out.write(xmpJpegBytes)
-                FileInputStream(mp4File).use { mp4In ->
-                    val buffer = ByteArray(64 * 1024)
-                    while (true) {
-                        ensureNotCancelled()
-                        val read = mp4In.read(buffer)
-                        if (read < 0) break
-                        out.write(buffer, 0, read)
+                if (prefixBytes != null && prefixBytes.isNotEmpty()) {
+                    out.write(prefixBytes)
+                }
+                if (bodyFile != null) {
+                    FileInputStream(bodyFile).use { bodyIn ->
+                        val buffer = ByteArray(64 * 1024)
+                        while (true) {
+                            ensureNotCancelled()
+                            val read = bodyIn.read(buffer)
+                            if (read < 0) break
+                            out.write(buffer, 0, read)
+                        }
                     }
                 }
                 out.flush()
@@ -918,7 +1013,7 @@ class MotionPhotoConverter(
             ensureNotCancelled()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val completeValues = ContentValues().apply {
-                    put(MediaStore.Images.Media.IS_PENDING, 0)
+                    put(MediaStore.MediaColumns.IS_PENDING, 0)
                 }
                 resolver.update(itemUri, completeValues, null, null)
             }
@@ -930,6 +1025,590 @@ class MotionPhotoConverter(
             }
             throw e
         }
+    }
+
+    fun exportStandaloneAsync(
+        mode: String,
+        videoPath: String,
+        coverTimeMs: Long,
+        quality: String,
+        keepAudio: Boolean,
+        customCoverPath: String? = null,
+        trimStartMs: Long? = null,
+        trimEndMs: Long? = null,
+        preserveMetadata: Boolean = true,
+        playbackSpeed: Double = 1.0,
+        onSuccess: (NativeConversionOutcome) -> Unit,
+        onError: (code: String, message: String) -> Unit,
+    ) {
+        cancelled.set(false)
+        val safeSpeed = playbackSpeed.coerceIn(0.5, 4.0)
+        workerExecutor.execute {
+            val startTime = System.currentTimeMillis()
+            val inputFile = File(videoPath)
+            if (!inputFile.exists()) {
+                mainHandler.post { onError("FILE_NOT_FOUND", "找不到所选视频文件") }
+                return@execute
+            }
+
+            val workId = UUID.randomUUID().toString()
+            val tempDir = File(context.cacheDir, "export_work_$workId").apply { mkdirs() }
+            val tempMp4File = File(tempDir, "standalone.mp4")
+
+            try {
+                ensureNotCancelled()
+                val inspection = inspectSourceVideo(
+                    inputFile = inputFile,
+                    coverTimeMs = coverTimeMs,
+                    customCoverPath = customCoverPath,
+                    trimStartMs = trimStartMs,
+                    trimEndMs = trimEndMs,
+                    preserveMetadata = preserveMetadata,
+                )
+                val captureTimeMs = if (preserveMetadata) inspection.captureTimeMs else null
+                val timestampStr = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
+                    .format(Date(captureTimeMs ?: System.currentTimeMillis()))
+
+                if (mode == "cover") {
+                    emitProgress(
+                        "cover",
+                        0.45,
+                        if (!customCoverPath.isNullOrBlank()) "正在导出自定义高清封面..." else "正在导出当前高清封面...",
+                    )
+                    val preparedJpeg = if (preserveMetadata &&
+                        (inspection.captureTimeMs != null || inspection.location != null)
+                    ) {
+                        applyExifMetadataToJpeg(
+                            jpegBytes = inspection.rawCoverJpegBytes,
+                            tempDir = tempDir,
+                            captureTimeMs = inspection.captureTimeMs,
+                            location = inspection.location,
+                        )
+                    } else {
+                        inspection.rawCoverJpegBytes
+                    }
+                    ensureNotCancelled()
+                    emitProgress("packaging", 0.92, "正在写入系统相册...")
+                    val savedUri = writeMediaToMediaStore(
+                        contentUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                        displayName = "IMG_Unclip_$timestampStr.jpg",
+                        mimeType = "image/jpeg",
+                        dateTakenKey = MediaStore.Images.Media.DATE_TAKEN,
+                        captureTimeMs = captureTimeMs,
+                        prefixBytes = preparedJpeg,
+                        bodyFile = null,
+                    )
+                    val elapsed = System.currentTimeMillis() - startTime
+                    mainHandler.post {
+                        onSuccess(
+                            NativeConversionOutcome(
+                                savedUri = savedUri.toString(),
+                                outputSizeBytes = preparedJpeg.size.toLong(),
+                                elapsedMs = elapsed,
+                            )
+                        )
+                    }
+                    return@execute
+                }
+
+                emitProgress("video", 0.12, "正在准备导出普通视频...")
+                val preparedMp4 = prepareMp4Trailer(
+                    inputFile = inputFile,
+                    tempMp4File = tempMp4File,
+                    srcWidth = inspection.width,
+                    srcHeight = inspection.height,
+                    durationMs = inspection.durationMs,
+                    trimStartMs = inspection.safeTrimStartMs,
+                    trimEndMs = inspection.safeTrimEndMs,
+                    isTrimmed = inspection.isTrimmed,
+                    hasAudioTrack = inspection.hasAudioTrack,
+                    isHdr = inspection.isHdr,
+                    quality = quality,
+                    keepAudio = keepAudio,
+                    playbackSpeed = safeSpeed,
+                )
+                ensureNotCancelled()
+                val mp4Length = preparedMp4.length()
+                if (mp4Length <= 0L) {
+                    throw IllegalStateException("导出的视频文件为空")
+                }
+
+                emitProgress("packaging", 0.94, "正在保存视频至系统相册...")
+                val savedUri = writeMediaToMediaStore(
+                    contentUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                    displayName = "VID_Unclip_$timestampStr.mp4",
+                    mimeType = "video/mp4",
+                    dateTakenKey = MediaStore.Video.Media.DATE_TAKEN,
+                    captureTimeMs = captureTimeMs,
+                    prefixBytes = null,
+                    bodyFile = preparedMp4,
+                )
+                val elapsed = System.currentTimeMillis() - startTime
+                mainHandler.post {
+                    onSuccess(
+                        NativeConversionOutcome(
+                            savedUri = savedUri.toString(),
+                            outputSizeBytes = mp4Length,
+                            elapsedMs = elapsed,
+                        )
+                    )
+                }
+            } catch (_: CancellationException) {
+                mainHandler.post {
+                    onError("CANCELLED", "已取消导出")
+                }
+            } catch (e: Exception) {
+                if (cancelled.get()) {
+                    mainHandler.post {
+                        onError("CANCELLED", "已取消导出")
+                    }
+                } else {
+                    mainHandler.post {
+                        onError("EXPORT_FAILED", e.message ?: "导出失败")
+                    }
+                }
+            } finally {
+                tempDir.deleteRecursively()
+            }
+        }
+    }
+
+    fun unpackMotionPhotoAsync(
+        filePath: String,
+        onSuccess: (NativeUnpackedLivePhoto) -> Unit,
+        onError: (code: String, message: String) -> Unit,
+    ) {
+        workerExecutor.execute {
+            val inputFile = File(filePath)
+            if (!inputFile.exists() || inputFile.length() < 24L) {
+                mainHandler.post {
+                    onError("FILE_NOT_FOUND", "找不到所选动态照片文件")
+                }
+                return@execute
+            }
+
+            try {
+                val unpackedDir = File(context.cacheDir, "unpacked_live").apply { mkdirs() }
+                pruneOldCacheFiles(unpackedDir, maxAgeMs = 24L * 3600L * 1000L)
+
+                val located = locateEmbeddedMp4InMotionPhoto(inputFile)
+                if (located == null) {
+                    mainHandler.post {
+                        onError("NOT_LIVE_PHOTO", "所选图片不包含实况视频轨道，请选择动态照片")
+                    }
+                    return@execute
+                }
+
+                val stamp = "${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}"
+                val outVideo = File(unpackedDir, "unpacked_$stamp.mp4")
+                val outCover = File(unpackedDir, "unpacked_cover_$stamp.jpg")
+
+                RandomAccessFile(inputFile, "r").use { raf ->
+                    // 1. Stream clean JPEG cover (stripping Motion Photo XMP segment if present)
+                    streamRangeSkippingSpan(
+                        raf = raf,
+                        start = 0L,
+                        end = located.jpegEnd,
+                        skipStart = located.xmpSegmentStart,
+                        skipEnd = located.xmpSegmentEnd,
+                        outFile = outCover,
+                    )
+                    // 2. Stream embedded MP4 trailer
+                    streamRangeSkippingSpan(
+                        raf = raf,
+                        start = located.mp4Start,
+                        end = inputFile.length(),
+                        skipStart = -1L,
+                        skipEnd = -1L,
+                        outFile = outVideo,
+                    )
+                }
+
+                if (!outVideo.exists() || outVideo.length() < 16L) {
+                    outVideo.delete()
+                    outCover.delete()
+                    mainHandler.post {
+                        onError("NOT_LIVE_PHOTO", "未能提取有效实况视频轨道")
+                    }
+                    return@execute
+                }
+
+                val coverPath = if (outCover.exists() && outCover.length() >= 4L) {
+                    outCover.absolutePath
+                } else {
+                    null
+                }
+                val coverMs = (located.presentationTimestampUs / 1000L).coerceAtLeast(0L)
+                mainHandler.post {
+                    onSuccess(
+                        NativeUnpackedLivePhoto(
+                            videoPath = outVideo.absolutePath,
+                            coverImagePath = coverPath,
+                            coverTimeMs = coverMs,
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                mainHandler.post {
+                    onError("UNPACK_FAILED", e.message ?: "拆解动态照片失败")
+                }
+            }
+        }
+    }
+
+    private data class LocatedMotionPhoto(
+        val jpegEnd: Long,
+        val mp4Start: Long,
+        val presentationTimestampUs: Long,
+        val xmpSegmentStart: Long,
+        val xmpSegmentEnd: Long,
+    )
+
+    private fun pruneOldCacheFiles(dir: File, maxAgeMs: Long) {
+        val cutoff = System.currentTimeMillis() - maxAgeMs
+        dir.listFiles()?.forEach { child ->
+            if (child.lastModified() < cutoff) {
+                try {
+                    child.deleteRecursively()
+                } catch (_: Exception) {
+                }
+            }
+        }
+    }
+
+    private fun streamRangeSkippingSpan(
+        raf: RandomAccessFile,
+        start: Long,
+        end: Long,
+        skipStart: Long,
+        skipEnd: Long,
+        outFile: File,
+    ) {
+        if (end <= start) return
+        FileOutputStream(outFile).use { out ->
+            val buf = ByteArray(64 * 1024)
+            var pos = start
+            raf.seek(pos)
+            while (pos < end) {
+                if (skipStart in pos until skipEnd && skipStart == pos) {
+                    pos = skipEnd.coerceAtMost(end)
+                    raf.seek(pos)
+                    continue
+                }
+                val nextStop = if (skipStart in pos until end) skipStart else end
+                val toRead = min(buf.size.toLong(), nextStop - pos).toInt()
+                if (toRead <= 0) break
+                val read = raf.read(buf, 0, toRead)
+                if (read <= 0) break
+                out.write(buf, 0, read)
+                pos += read
+            }
+            out.flush()
+        }
+    }
+
+    private fun locateEmbeddedMp4InMotionPhoto(file: File): LocatedMotionPhoto? {
+        val fileLen = file.length()
+        if (fileLen < 24L) return null
+
+        RandomAccessFile(file, "r").use { raf ->
+            val headSize = min(fileLen, 256L * 1024L).toInt()
+            val head = ByteArray(headSize)
+            raf.seek(0L)
+            raf.readFully(head)
+
+            if ((head[0].toInt() and 0xFF) != 0xFF || (head[1].toInt() and 0xFF) != 0xD8) {
+                return null
+            }
+
+            val xmpHeader = "http://ns.adobe.com/xap/1.0/\u0000".toByteArray(StandardCharsets.US_ASCII)
+            var pos = 2
+            var videoLength = 0L
+            var presentationUs = 0L
+            var xmpSegStart = -1L
+            var xmpSegEnd = -1L
+
+            while (pos + 4 <= head.size) {
+                if ((head[pos].toInt() and 0xFF) != 0xFF) break
+                val marker = head[pos + 1].toInt() and 0xFF
+                if (marker == 0xDA || marker == 0xD9) break
+                if (marker == 0xFF || marker == 0x00) {
+                    pos++
+                    continue
+                }
+                val segLen = ((head[pos + 2].toInt() and 0xFF) shl 8) or (head[pos + 3].toInt() and 0xFF)
+                if (segLen < 2 || pos + 2 + segLen > head.size) break
+                val segEnd = pos + 2 + segLen
+
+                if (marker == 0xE1 && segLen >= 2 + xmpHeader.size &&
+                    matchesBytes(head, pos + 4, xmpHeader)
+                ) {
+                    val xml = String(head, pos + 4 + xmpHeader.size, segEnd - (pos + 4 + xmpHeader.size), StandardCharsets.UTF_8)
+                    val parsed = parseMotionPhotoXmp(xml)
+                    if (parsed != null) {
+                        videoLength = parsed.first
+                        presentationUs = parsed.second
+                        xmpSegStart = pos.toLong()
+                        xmpSegEnd = segEnd.toLong()
+                        break
+                    }
+                }
+                pos = segEnd
+            }
+
+            if (videoLength > 0L && videoLength < fileLen - 24L) {
+                val candidate = fileLen - videoLength
+                val resolved = resolveMp4AtOffset(raf, fileLen, candidate)
+                if (resolved != null) {
+                    return LocatedMotionPhoto(
+                        jpegEnd = resolved.first,
+                        mp4Start = resolved.second,
+                        presentationTimestampUs = presentationUs,
+                        xmpSegmentStart = xmpSegStart,
+                        xmpSegmentEnd = xmpSegEnd,
+                    )
+                }
+            }
+
+            // Fallback: find primary JPEG EOI (FF D9) via marker + entropy scan, then look for MP4 box
+            val eoiEnd = findPrimaryJpegEoiEnd(raf, fileLen)
+            if (eoiEnd != null && eoiEnd < fileLen - 16L) {
+                val resolvedDirect = resolveMp4AtOffset(raf, fileLen, eoiEnd)
+                if (resolvedDirect != null) {
+                    return LocatedMotionPhoto(
+                        jpegEnd = eoiEnd,
+                        mp4Start = resolvedDirect.second,
+                        presentationTimestampUs = presentationUs,
+                        xmpSegmentStart = xmpSegStart,
+                        xmpSegmentEnd = xmpSegEnd,
+                    )
+                }
+                val scannedMp4 = scanMp4AfterOffset(raf, fileLen, eoiEnd)
+                if (scannedMp4 != null) {
+                    return LocatedMotionPhoto(
+                        jpegEnd = eoiEnd,
+                        mp4Start = scannedMp4,
+                        presentationTimestampUs = presentationUs,
+                        xmpSegmentStart = xmpSegStart,
+                        xmpSegmentEnd = xmpSegEnd,
+                    )
+                }
+            }
+        }
+        return null
+    }
+
+    private fun parseMotionPhotoXmp(xml: String): Pair<Long, Long>? {
+        var videoLen = 0L
+        var tsUs = 0L
+
+        val tsMatch = Regex(
+            """(?:MotionPhotoPresentationTimestampUs|MicroVideoPresentationTimestampUs)(?:\s*=\s*"(\d+)"|>\s*(\d+)\s*<)"""
+        ).find(xml)
+        if (tsMatch != null) {
+            val raw = tsMatch.groupValues[1].ifEmpty { tsMatch.groupValues[2] }
+            tsUs = raw.toLongOrNull() ?: 0L
+        }
+
+        val liMatches = Regex("""<rdf:li\b[\s\S]*?(?:/>|</rdf:li>)""").findAll(xml)
+        for (m in liMatches) {
+            val block = m.value
+            if (!block.contains("MotionPhoto")) continue
+            val lenMatch = Regex("""Item:Length(?:\s*=\s*"(\d+)"|>\s*(\d+)\s*<)""").find(block)
+            val rawLen = lenMatch?.let { it.groupValues[1].ifEmpty { it.groupValues[2] } }
+            val parsedLen = rawLen?.toLongOrNull() ?: 0L
+            if (parsedLen > 0L) {
+                val padMatch = Regex("""Item:Padding(?:\s*=\s*"(\d+)"|>\s*(\d+)\s*<)""").find(block)
+                val rawPad = padMatch?.let { it.groupValues[1].ifEmpty { it.groupValues[2] } }
+                val padding = rawPad?.toLongOrNull() ?: 0L
+                videoLen = parsedLen + padding
+                break
+            }
+        }
+
+        if (videoLen <= 0L) {
+            val microMatch = Regex("""GCamera:MicroVideoOffset(?:\s*=\s*"(\d+)"|>\s*(\d+)\s*<)""").find(xml)
+            val rawMicro = microMatch?.let { it.groupValues[1].ifEmpty { it.groupValues[2] } }
+            videoLen = rawMicro?.toLongOrNull() ?: 0L
+        }
+
+        if (videoLen <= 0L && tsUs <= 0L) return null
+        return Pair(videoLen, tsUs)
+    }
+
+    private fun resolveMp4AtOffset(
+        raf: RandomAccessFile,
+        fileLen: Long,
+        candidate: Long,
+    ): Pair<Long, Long>? {
+        if (candidate < 4L || candidate + 16L > fileLen) return null
+        val probe = ByteArray(min(40L, fileLen - candidate).toInt())
+        raf.seek(candidate)
+        raf.readFully(probe)
+
+        if (hasValidFtypHeader(probe, 0, fileLen - candidate)) {
+            val jpegEnd = resolveJpegEndBefore(raf, fileLen, candidate) ?: return null
+            return Pair(jpegEnd, candidate)
+        }
+
+        val samsungMarker = "MotionPhoto_Data".toByteArray(StandardCharsets.US_ASCII)
+        if (probe.size >= samsungMarker.size + 12 &&
+            matchesBytes(probe, 0, samsungMarker) &&
+            hasValidFtypHeader(probe, samsungMarker.size, fileLen - (candidate + samsungMarker.size))
+        ) {
+            val jpegEnd = resolveJpegEndBefore(raf, fileLen, candidate) ?: return null
+            return Pair(jpegEnd, candidate + samsungMarker.size)
+        }
+        return null
+    }
+
+    private fun resolveJpegEndBefore(
+        raf: RandomAccessFile,
+        fileLen: Long,
+        limitOffset: Long,
+    ): Long? {
+        if (limitOffset >= 4L) {
+            val tail = ByteArray(2)
+            raf.seek(limitOffset - 2L)
+            raf.readFully(tail)
+            if ((tail[0].toInt() and 0xFF) == 0xFF && (tail[1].toInt() and 0xFF) == 0xD9) {
+                return limitOffset
+            }
+        }
+        val eoi = findPrimaryJpegEoiEnd(raf, limitOffset.coerceAtMost(fileLen))
+        if (eoi != null && eoi <= limitOffset) return eoi
+        return if (limitOffset >= 4L) limitOffset else null
+    }
+
+    private fun findPrimaryJpegEoiEnd(raf: RandomAccessFile, limitLen: Long): Long? {
+        var pos = 2L
+        var inEntropy = false
+
+        while (pos + 2L <= limitLen) {
+            if (!inEntropy) {
+                raf.seek(pos)
+                val first = raf.read()
+                if (first != 0xFF) return null
+                val marker = raf.read()
+                if (marker < 0) return null
+                if (marker == 0xFF || marker == 0x00) {
+                    pos++
+                    continue
+                }
+                if (marker == 0xD9) {
+                    return pos + 2L
+                }
+                if (marker == 0x01 || marker in 0xD0..0xD8) {
+                    pos += 2L
+                    continue
+                }
+                if (pos + 4L > limitLen) return null
+                val b2 = raf.read()
+                val b3 = raf.read()
+                if (b2 < 0 || b3 < 0) return null
+                val segLen = (b2 shl 8) or b3
+                if (segLen < 2 || pos + 2L + segLen > limitLen) return null
+                pos += 2L + segLen
+                if (marker == 0xDA) {
+                    inEntropy = true
+                }
+            } else {
+                val buf = ByteArray(64 * 1024)
+                raf.seek(pos)
+                var prevWasFf = false
+                while (pos < limitLen) {
+                    val toRead = min(buf.size.toLong(), limitLen - pos).toInt()
+                    val read = raf.read(buf, 0, toRead)
+                    if (read <= 0) break
+                    for (i in 0 until read) {
+                        val b = buf[i].toInt() and 0xFF
+                        val absPos = pos + i
+                        if (prevWasFf) {
+                            prevWasFf = false
+                            if (b == 0x00 || b in 0xD0..0xD7) {
+                                continue
+                            }
+                            if (b == 0xFF) {
+                                prevWasFf = true
+                                continue
+                            }
+                            if (b == 0xD9) {
+                                return absPos + 1L
+                            }
+                        } else if (b == 0xFF) {
+                            prevWasFf = true
+                        }
+                    }
+                    pos += read
+                }
+                return null
+            }
+        }
+        return null
+    }
+
+    private fun scanMp4AfterOffset(
+        raf: RandomAccessFile,
+        fileLen: Long,
+        startOffset: Long,
+    ): Long? {
+        val samsungMarker = "MotionPhoto_Data".toByteArray(StandardCharsets.US_ASCII)
+        val scanEnd = min(fileLen, startOffset + 512L * 1024L)
+        val chunkSize = 64 * 1024
+        val overlap = 32
+        val buf = ByteArray(chunkSize + overlap)
+        var pos = startOffset
+
+        while (pos < scanEnd) {
+            raf.seek(pos)
+            val toRead = min((chunkSize + overlap).toLong(), scanEnd - pos).toInt()
+            val read = raf.read(buf, 0, toRead)
+            if (read < 12) break
+
+            for (i in 0..(read - 12)) {
+                if (i + samsungMarker.size + 12 <= read &&
+                    matchesBytes(buf, i, samsungMarker) &&
+                    hasValidFtypHeader(buf, i + samsungMarker.size, fileLen - (pos + i + samsungMarker.size))
+                ) {
+                    return pos + i + samsungMarker.size
+                }
+                if (hasValidFtypHeader(buf, i, fileLen - (pos + i))) {
+                    return pos + i
+                }
+            }
+            if (pos + read >= scanEnd) break
+            pos += (read - overlap).coerceAtLeast(1)
+        }
+        return null
+    }
+
+    private fun hasValidFtypHeader(buf: ByteArray, offset: Int, remainingLen: Long): Boolean {
+        if (offset < 0 || offset + 12 > buf.size) return false
+        if (buf[offset + 4] != 'f'.code.toByte() ||
+            buf[offset + 5] != 't'.code.toByte() ||
+            buf[offset + 6] != 'y'.code.toByte() ||
+            buf[offset + 7] != 'p'.code.toByte()
+        ) {
+            return false
+        }
+        val boxSize = ((buf[offset].toInt() and 0xFF) shl 24) or
+            ((buf[offset + 1].toInt() and 0xFF) shl 16) or
+            ((buf[offset + 2].toInt() and 0xFF) shl 8) or
+            (buf[offset + 3].toInt() and 0xFF)
+        if (boxSize < 12 || boxSize > 512 || boxSize.toLong() > remainingLen) return false
+        for (i in 8 until 12) {
+            val c = buf[offset + i].toInt() and 0xFF
+            if (c < 0x20 || c > 0x7E) return false
+        }
+        return true
+    }
+
+    private fun matchesBytes(haystack: ByteArray, offset: Int, needle: ByteArray): Boolean {
+        if (offset < 0 || offset + needle.size > haystack.size) return false
+        for (i in needle.indices) {
+            if (haystack[offset + i] != needle[i]) return false
+        }
+        return true
     }
 
     fun extractThumbnailsAsync(
