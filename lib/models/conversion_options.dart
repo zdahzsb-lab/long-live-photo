@@ -2,6 +2,7 @@ enum QualityPreset {
   passthrough(
     wireValue: 'passthrough',
     segmentLabel: '原画秒转',
+    shortLabel: '原画',
     title: '原画直通 · 零重压',
     subtitle: '保留原片码率直接封装，1～3 秒出图',
     shortSideLimit: null,
@@ -10,6 +11,7 @@ enum QualityPreset {
   p1080(
     wireValue: '1080p',
     segmentLabel: '1080p 均衡',
+    shortLabel: '1080p',
     title: '1080p 高清均衡',
     subtitle: '硬件编码约 6 Mbps，高清且滑动流畅',
     shortSideLimit: 1080,
@@ -18,6 +20,7 @@ enum QualityPreset {
   p720(
     wireValue: '720p',
     segmentLabel: '720p 省流',
+    shortLabel: '720p',
     title: '720p 轻量省空间',
     subtitle: '硬件编码约 2.8 Mbps，适合超长视频',
     shortSideLimit: 720,
@@ -27,6 +30,7 @@ enum QualityPreset {
   const QualityPreset({
     required this.wireValue,
     required this.segmentLabel,
+    required this.shortLabel,
     required this.title,
     required this.subtitle,
     required this.shortSideLimit,
@@ -35,41 +39,139 @@ enum QualityPreset {
 
   final String wireValue;
   final String segmentLabel;
+  final String shortLabel;
   final String title;
   final String subtitle;
   final int? shortSideLimit;
   final int? videoBitrate;
 
-  /// Estimates output Live Photo size based on source bytes, duration, and audio toggle.
+  static QualityPreset fromWireValue(String value) {
+    for (final preset in QualityPreset.values) {
+      if (preset.wireValue == value) return preset;
+    }
+    return QualityPreset.p1080;
+  }
+
+  /// Estimates output Live Photo size based on source bytes, duration, speed, and audio toggle.
   int estimateOutputBytes({
     required int sourceSizeBytes,
     required Duration duration,
     required bool keepAudio,
     Duration? totalDuration,
+    double playbackSpeed = 1.0,
   }) {
     const int coverJpegOverhead = 650 * 1024;
+    final safeSpeed = VideoSpeedMath.clampSpeed(playbackSpeed);
+    final hasSpeed = VideoSpeedMath.isEffectivelyScaled(safeSpeed);
+    final outputDuration = VideoSpeedMath.scaledDuration(duration, safeSpeed);
+
     if (videoBitrate == null) {
-      if (sourceSizeBytes <= 0) return 0;
-      final audioFactor = keepAudio ? 1.0 : 0.94;
-      final double trimFactor;
-      if (totalDuration != null && totalDuration.inMilliseconds > 0) {
-        trimFactor = (duration.inMilliseconds / totalDuration.inMilliseconds)
-            .clamp(0.02, 1.0);
-      } else {
-        trimFactor = 1.0;
+      if (!hasSpeed) {
+        if (sourceSizeBytes <= 0) return 0;
+        final audioFactor = keepAudio ? 1.0 : 0.94;
+        final double trimFactor;
+        if (totalDuration != null && totalDuration.inMilliseconds > 0) {
+          trimFactor = (duration.inMilliseconds / totalDuration.inMilliseconds)
+              .clamp(0.02, 1.0);
+        } else {
+          trimFactor = 1.0;
+        }
+        return (sourceSizeBytes * audioFactor * trimFactor).round() +
+            coverJpegOverhead;
       }
-      return (sourceSizeBytes * audioFactor * trimFactor).round() +
-          coverJpegOverhead;
+
+      // Speed changes force hardware re-encoding (~14 Mbps high-bitrate profile).
+      final seconds = outputDuration.inMilliseconds / 1000.0;
+      if (seconds <= 0) return sourceSizeBytes;
+      final audioBps = keepAudio ? 160000 : 0;
+      final rawEncoded = ((14000000 + audioBps) / 8.0 * seconds).round();
+      final estimated = rawEncoded + coverJpegOverhead;
+      if (safeSpeed >= 1.0 &&
+          sourceSizeBytes > 0 &&
+          estimated > (sourceSizeBytes * 1.15).round() + coverJpegOverhead) {
+        return (sourceSizeBytes * 1.15).round() + coverJpegOverhead;
+      }
+      return estimated;
     }
-    final seconds = duration.inMilliseconds / 1000.0;
+
+    final seconds = outputDuration.inMilliseconds / 1000.0;
     if (seconds <= 0) return sourceSizeBytes;
     final audioBps = keepAudio ? 160000 : 0;
     final rawEncoded = ((videoBitrate! + audioBps) / 8.0 * seconds).round();
     final estimated = rawEncoded + coverJpegOverhead;
-    if (sourceSizeBytes > 0 && estimated > (sourceSizeBytes * 1.15).round()) {
+    if (safeSpeed >= 1.0 &&
+        sourceSizeBytes > 0 &&
+        estimated > (sourceSizeBytes * 1.15).round()) {
       return sourceSizeBytes + coverJpegOverhead;
     }
     return estimated;
+  }
+}
+
+enum PlaybackSpeedPreset {
+  slowHalf(rate: 0.5, label: '0.5x', shortTag: '0.5x 慢放'),
+  normal(rate: 1.0, label: '1x', shortTag: '原速'),
+  fast15(rate: 1.5, label: '1.5x', shortTag: '1.5x 轻快'),
+  fast2(rate: 2.0, label: '2x', shortTag: '2x 倍速'),
+  timelapse4(rate: 4.0, label: '4x', shortTag: '4x 延时');
+
+  const PlaybackSpeedPreset({
+    required this.rate,
+    required this.label,
+    required this.shortTag,
+  });
+
+  final double rate;
+  final String label;
+  final String shortTag;
+
+  bool get isModified => (rate - 1.0).abs() > 0.01;
+
+  static PlaybackSpeedPreset fromRate(double rate) {
+    final safe = VideoSpeedMath.clampSpeed(rate);
+    var best = PlaybackSpeedPreset.normal;
+    var bestDiff = double.infinity;
+    for (final preset in PlaybackSpeedPreset.values) {
+      final diff = (preset.rate - safe).abs();
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        best = preset;
+      }
+    }
+    return best;
+  }
+}
+
+/// Pure helpers for clamping and scaling timestamps under speed adjustments.
+abstract final class VideoSpeedMath {
+  static const double minSpeed = 0.5;
+  static const double maxSpeed = 4.0;
+
+  static double clampSpeed(double speed) =>
+      speed.isFinite ? speed.clamp(minSpeed, maxSpeed) : 1.0;
+
+  static bool isEffectivelyScaled(double speed) =>
+      (clampSpeed(speed) - 1.0).abs() > 0.01;
+
+  static Duration scaledDuration(Duration sourceDuration, double speed) {
+    if (sourceDuration.inMilliseconds <= 0) {
+      return Duration.zero;
+    }
+    final ms = (sourceDuration.inMilliseconds / clampSpeed(speed))
+        .round()
+        .clamp(100, 24 * 3600 * 1000);
+    return Duration(milliseconds: ms);
+  }
+
+  static int scaledCoverOffsetMs({
+    required int coverMs,
+    required int trimStartMs,
+    required int trimEndMs,
+    required double speed,
+  }) {
+    final span = (trimEndMs - trimStartMs).clamp(0, 1 << 30);
+    final rel = (coverMs - trimStartMs).clamp(0, span);
+    return (rel / clampSpeed(speed)).round();
   }
 }
 

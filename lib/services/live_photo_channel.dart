@@ -16,6 +16,7 @@ abstract class LivePhotoConverterGateway {
     int? trimStartMs,
     int? trimEndMs,
     bool preserveMetadata = true,
+    double playbackSpeed = 1.0,
   });
 
   Future<void> cancelConversion();
@@ -59,6 +60,7 @@ class NativeLivePhotoChannel implements LivePhotoConverterGateway {
     int? trimStartMs,
     int? trimEndMs,
     bool preserveMetadata = true,
+    double playbackSpeed = 1.0,
   }) async {
     final response = await _methodChannel.invokeMapMethod<Object?, Object?>(
       'convertAndSave',
@@ -71,6 +73,7 @@ class NativeLivePhotoChannel implements LivePhotoConverterGateway {
         'trimStartMs': trimStartMs,
         'trimEndMs': trimEndMs,
         'preserveMetadata': preserveMetadata,
+        'playbackSpeed': playbackSpeed,
       },
     );
 

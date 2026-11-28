@@ -29,6 +29,7 @@ class VideoStageCard extends StatelessWidget {
     this.customCoverPath,
     this.trimStartMs = 0,
     this.trimEndMs,
+    this.playbackSpeed = 1.0,
     this.isLivePreviewing = false,
     this.onPickCustomCover,
     this.onLiveHoldStart,
@@ -46,6 +47,7 @@ class VideoStageCard extends StatelessWidget {
   final String? customCoverPath;
   final int trimStartMs;
   final int? trimEndMs;
+  final double playbackSpeed;
   final bool isLivePreviewing;
   final VoidCallback? onPickCustomCover;
   final VoidCallback? onLiveHoldStart;
@@ -84,6 +86,20 @@ class VideoStageCard extends StatelessWidget {
     final playRatio = displayTotalMs > 0
         ? (displayCurrentMs / displayTotalMs).clamp(0.0, 1.0)
         : 0.0;
+    final safeSpeed = VideoSpeedMath.clampSpeed(playbackSpeed);
+    final hasSpeedChange = VideoSpeedMath.isEffectivelyScaled(safeSpeed);
+    final speedPreset = PlaybackSpeedPreset.fromRate(safeSpeed);
+    final hudCurrentMs = hasSpeedChange
+        ? (displayCurrentMs / safeSpeed).round()
+        : displayCurrentMs;
+    final hudTotalMs = hasSpeedChange
+        ? VideoSpeedMath.scaledDuration(
+            Duration(milliseconds: displayTotalMs),
+            safeSpeed,
+          ).inMilliseconds
+        : displayTotalMs;
+    final clampedHudCurrentMs =
+        hudTotalMs > 0 ? hudCurrentMs.clamp(0, hudTotalMs) : 0;
     final fastDur = Ui.motion(context, Ui.fast);
     final hasCustomCover =
         customCoverPath != null && customCoverPath!.isNotEmpty;
@@ -200,50 +216,76 @@ class VideoStageCard extends StatelessWidget {
             ),
           ),
 
-          // 4. Bottom-Left Tabular Timecode Readout (+ Live Hold indicator)
+          // 4. Bottom-Left Tabular Timecode Readout (+ Live Hold & Speed indicator)
           Positioned(
             bottom: Ui.s3,
             left: Ui.s3,
-            child: IgnorePointer(
-              child: Container(
-                height: 30,
-                padding: const EdgeInsets.symmetric(horizontal: 10),
-                alignment: Alignment.center,
-                decoration: BoxDecoration(
-                  color: Ui.hudScrim,
-                  borderRadius: BorderRadius.circular(Ui.rSm),
-                  border: Border.all(
-                    color: isLivePreviewing ? Ui.hairlineStrong : Ui.hairline,
-                  ),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: <Widget>[
-                    if (isLivePreviewing) ...<Widget>[
-                      Container(
-                        width: 6,
-                        height: 6,
-                        decoration: const BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: Ui.liveActive,
-                        ),
-                      ),
-                      const SizedBox(width: 5),
-                      Text(
-                        '实况预览',
-                        style: Ui.caption.copyWith(
-                          fontSize: 11,
-                          color: Ui.textPrimary,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      const SizedBox(width: 6),
-                    ],
-                    Text(
-                      '${formatPreciseDuration(Duration(milliseconds: displayCurrentMs))} / ${formatPreciseDuration(Duration(milliseconds: displayTotalMs))}',
-                      style: Ui.mono.copyWith(fontSize: 11.5),
+            right: onPickCustomCover != null ? 116 : Ui.s3,
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: IgnorePointer(
+                child: Container(
+                  height: 30,
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                  decoration: BoxDecoration(
+                    color: Ui.hudScrim,
+                    borderRadius: BorderRadius.circular(Ui.rSm),
+                    border: Border.all(
+                      color: (isLivePreviewing || hasSpeedChange)
+                          ? Ui.hairlineStrong
+                          : Ui.hairline,
                     ),
-                  ],
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      if (isLivePreviewing || hasSpeedChange) ...<Widget>[
+                        Container(
+                          width: 6,
+                          height: 6,
+                          decoration: const BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: Ui.liveActive,
+                          ),
+                        ),
+                        const SizedBox(width: 5),
+                      ],
+                      if (isLivePreviewing) ...<Widget>[
+                        Text(
+                          '实况预览',
+                          style: Ui.caption.copyWith(
+                            fontSize: 11,
+                            color: Ui.textPrimary,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                      ],
+                      if (hasSpeedChange) ...<Widget>[
+                        Text(
+                          speedPreset.label,
+                          style: Ui.mono.copyWith(
+                            fontSize: 11,
+                            color: Ui.textPrimary,
+                          ),
+                        ),
+                        const SizedBox(width: 5),
+                        Text(
+                          '·',
+                          style: Ui.caption.copyWith(color: Ui.textTertiary),
+                        ),
+                        const SizedBox(width: 5),
+                      ],
+                      Flexible(
+                        child: Text(
+                          '${formatPreciseDuration(Duration(milliseconds: clampedHudCurrentMs))} / ${formatPreciseDuration(Duration(milliseconds: hudTotalMs))}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Ui.mono.copyWith(fontSize: 11.5),
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),

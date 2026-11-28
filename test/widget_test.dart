@@ -1,11 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:long_live_photo/constants/app_branding.dart';
 import 'package:long_live_photo/main.dart';
+import 'package:long_live_photo/models/conversion_history.dart';
 import 'package:long_live_photo/models/conversion_options.dart';
+import 'package:long_live_photo/services/conversion_history_store.dart';
 import 'package:long_live_photo/services/live_photo_channel.dart';
 import 'package:long_live_photo/ui/buttons.dart';
 import 'package:long_live_photo/utils/motion_photo_spec.dart';
@@ -25,6 +28,7 @@ class _ControllableGateway implements LivePhotoConverterGateway {
   int? lastTrimStartMs;
   int? lastTrimEndMs;
   bool? lastPreserveMetadata;
+  double? lastPlaybackSpeed;
   int cancelCalls = 0;
 
   @override
@@ -40,6 +44,7 @@ class _ControllableGateway implements LivePhotoConverterGateway {
     int? trimStartMs,
     int? trimEndMs,
     bool preserveMetadata = true,
+    double playbackSpeed = 1.0,
   }) {
     lastVideoPath = videoPath;
     lastCoverTimeMs = coverTimeMs;
@@ -49,6 +54,7 @@ class _ControllableGateway implements LivePhotoConverterGateway {
     lastTrimStartMs = trimStartMs;
     lastTrimEndMs = trimEndMs;
     lastPreserveMetadata = preserveMetadata;
+    lastPlaybackSpeed = playbackSpeed;
     final completer = Completer<ConversionResult>();
     pendingConversion = completer;
     return completer.future;
@@ -93,6 +99,7 @@ class _FakeVideoController extends VideoPlayerController {
   }
 
   double lastVolume = 1.0;
+  double lastPlaybackSpeed = 1.0;
   Duration lastSeek = const Duration(milliseconds: 500);
 
   @override
@@ -109,6 +116,12 @@ class _FakeVideoController extends VideoPlayerController {
   Future<void> setVolume(double volume) async {
     lastVolume = volume;
     value = value.copyWith(volume: volume);
+  }
+
+  @override
+  Future<void> setPlaybackSpeed(double speed) async {
+    lastPlaybackSpeed = speed;
+    value = value.copyWith(playbackSpeed: speed);
   }
 
   @override
@@ -218,6 +231,129 @@ void main() {
 
       expect(full1080, greaterThan(trimmed1080));
       expect(fullPassthrough, greaterThan(trimmedPassthrough));
+
+      final timelapse4x = QualityPreset.p1080.estimateOutputBytes(
+        sourceSizeBytes: 80 * 1024 * 1024,
+        duration: const Duration(seconds: 20),
+        totalDuration: const Duration(seconds: 20),
+        keepAudio: true,
+        playbackSpeed: 4.0,
+      );
+      final slowHalf = QualityPreset.p1080.estimateOutputBytes(
+        sourceSizeBytes: 80 * 1024 * 1024,
+        duration: const Duration(seconds: 20),
+        totalDuration: const Duration(seconds: 20),
+        keepAudio: true,
+        playbackSpeed: 0.5,
+      );
+      expect(timelapse4x, lessThan(full1080));
+      expect(slowHalf, greaterThan(full1080));
+    });
+
+    test('VideoSpeedMath & PlaybackSpeedPreset scale duration and cover offsets cleanly', () {
+      expect(PlaybackSpeedPreset.fromRate(0.5), PlaybackSpeedPreset.slowHalf);
+      expect(PlaybackSpeedPreset.fromRate(1.0), PlaybackSpeedPreset.normal);
+      expect(PlaybackSpeedPreset.fromRate(4.0), PlaybackSpeedPreset.timelapse4);
+      expect(PlaybackSpeedPreset.normal.isModified, isFalse);
+      expect(PlaybackSpeedPreset.timelapse4.isModified, isTrue);
+
+      expect(
+        VideoSpeedMath.scaledDuration(const Duration(seconds: 24), 4.0),
+        const Duration(seconds: 6),
+      );
+      expect(
+        VideoSpeedMath.scaledDuration(const Duration(seconds: 10), 0.5),
+        const Duration(seconds: 20),
+      );
+      expect(
+        VideoSpeedMath.scaledCoverOffsetMs(
+          coverMs: 9000,
+          trimStartMs: 1000,
+          trimEndMs: 21000,
+          speed: 4.0,
+        ),
+        2000,
+      );
+    });
+
+    test('ConversionHistoryEntry JSON & FileConversionHistoryStore persist, cap at 30, and clean up thumbnails', () async {
+      final tempRoot = Directory.systemTemp.createTempSync('unclip_hist_test_');
+      addTearDown(() {
+        if (tempRoot.existsSync()) {
+          tempRoot.deleteSync(recursive: true);
+        }
+      });
+
+      final now = DateTime(2026, 11, 28, 18, 30);
+      expect(
+        formatHistoryTimestamp(
+          DateTime(2026, 11, 28, 9, 5).millisecondsSinceEpoch,
+          now: now,
+        ),
+        '今天 09:05',
+      );
+      expect(
+        formatHistoryTimestamp(
+          DateTime(2026, 11, 27, 21, 15).millisecondsSinceEpoch,
+          now: now,
+        ),
+        '昨天 21:15',
+      );
+
+      final store = FileConversionHistoryStore(
+        baseDirProvider: () async => tempRoot,
+      );
+      expect(await store.load(), isEmpty);
+
+      for (int i = 0; i < 32; i++) {
+        await store.add(
+          ConversionHistoryEntry(
+            id: 'entry_$i',
+            createdAtMs: 1700000000000 + i * 1000,
+            sourceVideoPath: '/tmp/clip_$i.mp4',
+            savedTarget: 'content://media/$i',
+            platformFormat: 'Motion Photo',
+            sourceDurationMs: 20000,
+            outputDurationMs: 5000,
+            outputSizeBytes: 4 * 1024 * 1024,
+            elapsedMs: 1200,
+            qualityWireValue: '1080p',
+            playbackSpeed: 4.0,
+            keepAudio: i.isEven,
+            preserveMetadata: true,
+            wasTrimmed: false,
+            coverTimeMs: 500,
+          ),
+          thumbnailBytes: Uint8List.fromList(<int>[0xFF, 0xD8, i, 0xFF, 0xD9]),
+        );
+      }
+
+      // Reload via fresh instance to confirm disk persistence & 30-item cap
+      final reloadedStore = FileConversionHistoryStore(
+        baseDirProvider: () async => tempRoot,
+      );
+      final loaded = await reloadedStore.load();
+      expect(loaded.length, 30);
+      expect(loaded.first.id, 'entry_31');
+      expect(loaded.last.id, 'entry_2');
+      expect(loaded.first.speedPreset, PlaybackSpeedPreset.timelapse4);
+      expect(File(loaded.first.thumbnailPath!).existsSync(), isTrue);
+
+      // Evicted oldest entries should have had their thumbnail files cleaned up
+      final evictedThumb = File(
+        '${tempRoot.path}${Platform.pathSeparator}unclip_history${Platform.pathSeparator}thumbs${Platform.pathSeparator}entry_0.jpg',
+      );
+      expect(evictedThumb.existsSync(), isFalse);
+
+      // Delete single item removes both entry and its thumbnail
+      final deletedPath = loaded.first.thumbnailPath!;
+      final afterDelete = await reloadedStore.removeById('entry_31');
+      expect(afterDelete.length, 29);
+      expect(File(deletedPath).existsSync(), isFalse);
+
+      // Clear wipes everything cleanly
+      await reloadedStore.clear();
+      expect(await reloadedStore.load(), isEmpty);
     });
 
     test('MotionPhotoSpec injects dual-standard XMP APP1 and MP4 trailer', () {
@@ -274,12 +410,18 @@ void main() {
       tester.view.physicalSize = const Size(375 * 3, 667 * 3);
       tester.view.devicePixelRatio = 3.0;
 
-      await tester.pumpWidget(LongLivePhotoApp(gateway: gateway));
+      await tester.pumpWidget(
+        LongLivePhotoApp(
+          gateway: gateway,
+          historyStore: InMemoryConversionHistoryStore(),
+        ),
+      );
       await tester.pumpAndSettle();
 
       expect(find.text(AppBranding.appName), findsOneWidget);
       expect(find.text('长视频转实况照片'), findsOneWidget);
       expect(find.text('从相册选视频'), findsOneWidget);
+      expect(find.byKey(const Key('history_drawer_button')), findsOneWidget);
 
       for (final rt in tester.widgetList<RichText>(find.byType(RichText))) {
         expect(rt.text.style?.decoration, isNot(equals(TextDecoration.underline)));
@@ -291,6 +433,7 @@ void main() {
           data: const MediaQueryData(textScaler: TextScaler.linear(1.4)),
           child: LongLivePhotoApp(
             gateway: gateway,
+            historyStore: InMemoryConversionHistoryStore(),
             debugInitialController: fakeCtrl,
             debugInitialVideoPath: 'mock://clip.mp4',
             debugInitialSizeBytes: 32 * 1024 * 1024,
@@ -301,6 +444,7 @@ void main() {
       expect(tester.takeException(), isNull);
       expect(find.byKey(const Key('custom_cover_button')), findsOneWidget);
       expect(find.byKey(const Key('preserve_metadata_toggle')), findsOneWidget);
+      expect(find.byKey(const Key('speed_segmented_tabs')), findsOneWidget);
 
       // 3. Landscape phone (844x390) + 1.4x Dynamic Type
       tester.view.physicalSize = const Size(844 * 3, 390 * 3);
@@ -309,6 +453,7 @@ void main() {
           data: const MediaQueryData(textScaler: TextScaler.linear(1.4)),
           child: LongLivePhotoApp(
             gateway: gateway,
+            historyStore: InMemoryConversionHistoryStore(),
             debugInitialController: fakeCtrl,
             debugInitialVideoPath: 'mock://clip.mp4',
             debugInitialSizeBytes: 32 * 1024 * 1024,
@@ -390,6 +535,7 @@ void main() {
       await tester.pumpWidget(
         LongLivePhotoApp(
           gateway: gateway,
+          historyStore: InMemoryConversionHistoryStore(),
           debugInitialController: fakeCtrl,
           debugInitialVideoPath: 'mock://clip.mp4',
           debugInitialSizeBytes: 32 * 1024 * 1024,
@@ -475,13 +621,16 @@ void main() {
       tester.view.physicalSize = const Size(390 * 3, 844 * 3);
       tester.view.devicePixelRatio = 3.0;
 
+      final historyStore = InMemoryConversionHistoryStore();
       await tester.pumpWidget(
         LongLivePhotoApp(
           gateway: gateway,
+          historyStore: historyStore,
           debugInitialController: fakeCtrl,
           debugInitialVideoPath: 'mock://clip.mp4',
           debugInitialSizeBytes: 32 * 1024 * 1024,
           debugInitialCustomCoverPath: 'mock://portrait_cover.jpg',
+          debugFileExistsChecker: (String path) async => path == 'mock://clip.mp4',
         ),
       );
       await tester.pumpAndSettle();
@@ -497,7 +646,14 @@ void main() {
       expect(fakeCtrl.lastVolume, 0.0);
       expect(fakeCtrl.value.isPlaying, isFalse);
 
-      // Hold-to-preview-Live gesture on stage
+      // Select 4x timelapse speed -> updates preview playback speed & HUD timecode
+      await tester.tap(find.text('4x'));
+      await tester.pumpAndSettle();
+      expect(fakeCtrl.lastPlaybackSpeed, 4.0);
+      expect(find.text('延时'), findsOneWidget);
+      expect(find.textContaining('00:06.2'), findsWidgets);
+
+      // Hold-to-preview-Live gesture on stage uses selected speed
       final holdGesture = await tester.startGesture(
         tester.getCenter(find.byKey(const Key('video_viewport_tap'))),
       );
@@ -543,14 +699,130 @@ void main() {
       expect(gateway.lastPreserveMetadata, isTrue);
       expect(gateway.lastQuality, QualityPreset.p720);
       expect(gateway.lastKeepAudio, isFalse);
+      expect(gateway.lastPlaybackSpeed, 4.0);
 
       expect(find.text('已存入系统相册'), findsOneWidget);
+      expect(find.text('输出时长'), findsOneWidget);
+      expect(find.text('4x 延时'), findsOneWidget);
       expect(find.text('9.0 MB'), findsOneWidget);
       expect(find.text('1.8s'), findsOneWidget);
 
       await tester.tap(find.byKey(const Key('result_done_button')));
       await tester.pumpAndSettle();
       expect(find.text('已存入系统相册'), findsNothing);
+
+      // Header history badge updated to 1
+      expect(find.text('记录 1'), findsOneWidget);
+
+      // Reset parameters to 1x + 1080p, then restore from history drawer
+      await tester.tap(find.text('1x'));
+      await tester.tap(find.text('1080p 均衡'));
+      await tester.pumpAndSettle();
+      expect(fakeCtrl.lastPlaybackSpeed, 1.0);
+
+      await tester.tap(find.byKey(const Key('history_drawer_button')));
+      await tester.pumpAndSettle();
+      expect(find.text('合成记录'), findsOneWidget);
+
+      final recorded = await historyStore.load();
+      expect(recorded.length, 1);
+      await tester.tap(find.byKey(Key('history_entry_${recorded.first.id}')));
+      await tester.pumpAndSettle();
+
+      expect(fakeCtrl.lastPlaybackSpeed, 4.0);
+      expect(find.text('已恢复上次合成参数'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'History drawer handles empty state, missing-file notice, single delete, and 2-step clear all',
+    (WidgetTester tester) async {
+      final gateway = _ControllableGateway();
+      final missingEntry = ConversionHistoryEntry(
+        id: 'missing_1',
+        createdAtMs: DateTime.now().millisecondsSinceEpoch,
+        sourceVideoPath: 'mock://deleted_video.mp4',
+        savedTarget: 'mock://saved/1',
+        platformFormat: 'Live Photo',
+        sourceDurationMs: 12000,
+        outputDurationMs: 6000,
+        outputSizeBytes: 5 * 1024 * 1024,
+        elapsedMs: 1500,
+        qualityWireValue: '1080p',
+        playbackSpeed: 2.0,
+        keepAudio: true,
+        preserveMetadata: true,
+        wasTrimmed: false,
+        coverTimeMs: 400,
+      );
+      final keepEntry = ConversionHistoryEntry(
+        id: 'keep_2',
+        createdAtMs: DateTime.now().millisecondsSinceEpoch - 60000,
+        sourceVideoPath: 'mock://other_video.mp4',
+        savedTarget: 'mock://saved/2',
+        platformFormat: 'Live Photo',
+        sourceDurationMs: 8000,
+        outputDurationMs: 16000,
+        outputSizeBytes: 8 * 1024 * 1024,
+        elapsedMs: 2100,
+        qualityWireValue: '720p',
+        playbackSpeed: 0.5,
+        keepAudio: false,
+        preserveMetadata: true,
+        wasTrimmed: true,
+        trimStartMs: 1000,
+        trimEndMs: 9000,
+        coverTimeMs: 2000,
+      );
+      final store = InMemoryConversionHistoryStore(<ConversionHistoryEntry>[
+        missingEntry,
+        keepEntry,
+      ]);
+
+      addTearDown(() {
+        gateway.dispose();
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      tester.view.physicalSize = const Size(390 * 3, 844 * 3);
+      tester.view.devicePixelRatio = 3.0;
+
+      await tester.pumpWidget(
+        LongLivePhotoApp(
+          gateway: gateway,
+          historyStore: store,
+          debugFileExistsChecker: (_) async => false,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('记录 2'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('history_drawer_button')));
+      await tester.pumpAndSettle();
+
+      // Tapping entry whose source file is gone closes drawer & shows friendly toast
+      await tester.tap(find.byKey(const Key('history_entry_missing_1')));
+      await tester.pumpAndSettle();
+      expect(find.text('原视频文件已移除，无法重新载入'), findsOneWidget);
+
+      // Re-open, delete one entry, then 2-step confirm clear all
+      await tester.tap(find.byKey(const Key('history_drawer_button')));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('history_delete_missing_1')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('history_entry_missing_1')), findsNothing);
+      expect(find.byKey(const Key('history_entry_keep_2')), findsOneWidget);
+
+      // First tap enters confirm state; second tap clears all
+      await tester.tap(find.byKey(const Key('history_clear_all_button')));
+      await tester.pumpAndSettle();
+      expect(find.text('确认清空'), findsOneWidget);
+
+      await tester.tap(find.byKey(const Key('history_clear_all_button')));
+      await tester.pumpAndSettle();
+      expect(find.text('暂无合成记录'), findsOneWidget);
     },
   );
 }

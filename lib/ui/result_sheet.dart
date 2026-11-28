@@ -11,8 +11,10 @@ Future<void> showConversionResultSheet({
   required BuildContext context,
   required Duration duration,
   required ConversionResult result,
+  PlaybackSpeedPreset playbackSpeed = PlaybackSpeedPreset.normal,
 }) {
   final elapsedSec = (result.elapsedMs / 1000).toStringAsFixed(1);
+  final hasSpeed = playbackSpeed.isModified;
 
   return showModalBottomSheet<void>(
     context: context,
@@ -48,6 +50,25 @@ Future<void> showConversionResultSheet({
                   const Expanded(
                     child: Text('已存入系统相册', style: Ui.title),
                   ),
+                  if (hasSpeed)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 3,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Ui.bg,
+                        borderRadius: BorderRadius.circular(Ui.rSm),
+                        border: Border.all(color: Ui.hairlineStrong),
+                      ),
+                      child: Text(
+                        playbackSpeed.shortTag,
+                        style: Ui.mono.copyWith(
+                          fontSize: 11.5,
+                          color: Ui.textPrimary,
+                        ),
+                      ),
+                    ),
                 ],
               ),
               const SizedBox(height: Ui.s5),
@@ -65,7 +86,7 @@ Future<void> showConversionResultSheet({
                   children: <Widget>[
                     Expanded(
                       child: _MetricCell(
-                        label: '完整时长',
+                        label: hasSpeed ? '输出时长' : '完整时长',
                         value: formatPreciseDuration(duration),
                       ),
                     ),

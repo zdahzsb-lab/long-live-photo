@@ -51,6 +51,8 @@ class MainActivity : FlutterActivity() {
                         val trimStartMs = call.argument<Number>("trimStartMs")?.toLong()
                         val trimEndMs = call.argument<Number>("trimEndMs")?.toLong()
                         val preserveMetadata = call.argument<Boolean>("preserveMetadata") ?: true
+                        val playbackSpeed = (call.argument<Number>("playbackSpeed")?.toDouble() ?: 1.0)
+                            .coerceIn(0.5, 4.0)
 
                         setKeepScreenOn(true)
 
@@ -63,6 +65,7 @@ class MainActivity : FlutterActivity() {
                             trimStartMs = trimStartMs,
                             trimEndMs = trimEndMs,
                             preserveMetadata = preserveMetadata,
+                            playbackSpeed = playbackSpeed,
                             onSuccess = { outcome ->
                                 setKeepScreenOn(false)
                                 result.success(

@@ -47,6 +47,8 @@ import CoreLocation
         let trimStartMs = (args["trimStartMs"] as? NSNumber)?.int64Value
         let trimEndMs = (args["trimEndMs"] as? NSNumber)?.int64Value
         let preserveMetadata = (args["preserveMetadata"] as? Bool) ?? true
+        let rawSpeed = (args["playbackSpeed"] as? NSNumber)?.doubleValue ?? 1.0
+        let playbackSpeed = min(max(rawSpeed, 0.5), 4.0)
 
         self?.handleConvertAndSave(
           videoPath: videoPath,
@@ -57,6 +59,7 @@ import CoreLocation
           trimStartMs: trimStartMs,
           trimEndMs: trimEndMs,
           preserveMetadata: preserveMetadata,
+          playbackSpeed: playbackSpeed,
           result: result
         )
 
@@ -173,6 +176,7 @@ import CoreLocation
     trimStartMs: Int64?,
     trimEndMs: Int64?,
     preserveMetadata: Bool,
+    playbackSpeed: Double,
     result: @escaping FlutterResult
   ) {
     PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
@@ -201,6 +205,7 @@ import CoreLocation
           trimStartMs: trimStartMs,
           trimEndMs: trimEndMs,
           preserveMetadata: preserveMetadata,
+          playbackSpeed: playbackSpeed,
           result: result
         )
       }
@@ -216,6 +221,7 @@ import CoreLocation
     trimStartMs: Int64?,
     trimEndMs: Int64?,
     preserveMetadata: Bool,
+    playbackSpeed: Double,
     result: @escaping FlutterResult
   ) {
     let startTime = CFAbsoluteTimeGetCurrent()
@@ -319,6 +325,16 @@ import CoreLocation
       start: CMTime(seconds: trimStartSec, preferredTimescale: 600),
       duration: CMTime(seconds: trimDurationSec, preferredTimescale: 600)
     )
+    let hasSpeedChange = abs(playbackSpeed - 1.0) > 0.01
+    let outputStillTime: CMTime
+    if hasSpeedChange {
+      let scaledTotalSec = max(trimDurationSec / playbackSpeed, 0.1)
+      let relativeCoverSec = max(0.0, clampedCoverSec - trimStartSec)
+      let scaledStillSec = min(max(relativeCoverSec / playbackSpeed, 0.0), max(scaledTotalSec - 0.03, 0.0))
+      outputStillTime = CMTime(seconds: scaledStillSec, preferredTimescale: 600)
+    } else {
+      outputStillTime = coverCMTime
+    }
 
     buildPairedLiveVideo(
       asset: asset,
@@ -326,10 +342,11 @@ import CoreLocation
       isTrimmed: isTrimmed,
       trimStartSec: trimStartSec,
       trimDurationSec: trimDurationSec,
-      stillImageTime: coverCMTime,
+      stillImageTime: outputStillTime,
       assetIdentifier: assetId,
       quality: quality,
       keepAudio: keepAudio,
+      playbackSpeed: playbackSpeed,
       outputURL: pairedVideoURL
     ) { [weak self] videoError, wasCancelled in
       guard let self = self else {
@@ -570,6 +587,14 @@ import CoreLocation
     }
   }
 
+  private func formatSpeedTag(_ speed: Double) -> String {
+    if abs(speed - 0.5) < 0.05 { return "0.5x 慢放" }
+    if abs(speed - 1.5) < 0.05 { return "1.5x 倍速" }
+    if abs(speed - 2.0) < 0.05 { return "2x 倍速" }
+    if abs(speed - 4.0) < 0.05 { return "4x 延时" }
+    return String(format: "%.1fx 倍速", speed)
+  }
+
   private func buildPairedLiveVideo(
     asset: AVAsset,
     trimRange: CMTimeRange,
@@ -580,6 +605,7 @@ import CoreLocation
     assetIdentifier: String,
     quality: String,
     keepAudio: Bool,
+    playbackSpeed: Double,
     outputURL: URL,
     completion: @escaping (Error?, Bool) -> Void
   ) {
@@ -589,8 +615,67 @@ import CoreLocation
     }
 
     do {
-      let reader = try AVAssetReader(asset: asset)
-      if isTrimmed {
+      let safeSpeed = min(max(playbackSpeed, 0.5), 4.0)
+      let hasSpeedChange = abs(safeSpeed - 1.0) > 0.01
+
+      let readerAsset: AVAsset
+      let readerVideoTrack: AVAssetTrack
+      var compositionAudioTrack: AVMutableCompositionTrack?
+      var outputSpanSec = trimDurationSec
+
+      if hasSpeedChange {
+        let composition = AVMutableComposition()
+        guard let compVideoTrack = composition.addMutableTrack(
+          withMediaType: .video,
+          preferredTrackID: kCMPersistentTrackID_Invalid
+        ) else {
+          completion(NSError(domain: "LongLivePhoto", code: -25, userInfo: [NSLocalizedDescriptionKey: "无法创建倍速视频合成轨道"]), false)
+          return
+        }
+
+        let intersectedVideo = trimRange.intersection(videoTrack.timeRange)
+        let sourceInsertRange = (!intersectedVideo.isEmpty && CMTimeGetSeconds(intersectedVideo.duration) > 0.05)
+          ? intersectedVideo
+          : trimRange
+        try compVideoTrack.insertTimeRange(sourceInsertRange, of: videoTrack, at: .zero)
+        compVideoTrack.preferredTransform = videoTrack.preferredTransform
+
+        if keepAudio,
+           let srcAudio = asset.tracks(withMediaType: .audio).first,
+           let compAudio = composition.addMutableTrack(
+             withMediaType: .audio,
+             preferredTrackID: kCMPersistentTrackID_Invalid
+           ) {
+          let audioRange = sourceInsertRange.intersection(srcAudio.timeRange)
+          if !audioRange.isEmpty && CMTimeGetSeconds(audioRange.duration) > 0.05 {
+            let rawOffset = CMTimeSubtract(audioRange.start, sourceInsertRange.start)
+            let insertAt = CMTimeCompare(rawOffset, .zero) > 0 ? rawOffset : .zero
+            try compAudio.insertTimeRange(audioRange, of: srcAudio, at: insertAt)
+            compositionAudioTrack = compAudio
+          } else {
+            composition.removeTrack(compAudio)
+          }
+        }
+
+        let insertedDuration = CMTimeGetSeconds(compVideoTrack.timeRange.duration) > 0.05
+          ? compVideoTrack.timeRange.duration
+          : sourceInsertRange.duration
+        outputSpanSec = max(CMTimeGetSeconds(insertedDuration) / safeSpeed, 0.1)
+        let scaledDuration = CMTime(seconds: outputSpanSec, preferredTimescale: 600)
+        composition.scaleTimeRange(
+          CMTimeRange(start: .zero, duration: insertedDuration),
+          toDuration: scaledDuration
+        )
+
+        readerAsset = composition
+        readerVideoTrack = compVideoTrack
+      } else {
+        readerAsset = asset
+        readerVideoTrack = videoTrack
+      }
+
+      let reader = try AVAssetReader(asset: readerAsset)
+      if !hasSpeedChange && isTrimmed {
         reader.timeRange = trimRange
       }
 
@@ -633,19 +718,19 @@ import CoreLocation
         : (videoTrack.formatDescriptions[0] as! CMFormatDescription)
       let codecSubType: FourCharCode = sourceFormatDesc.map { CMFormatDescriptionGetMediaSubType($0) } ?? 0
       let canPassthroughCodec = (codecSubType == kCMVideoCodecType_H264 || codecSubType == kCMVideoCodecType_HEVC)
-      // Raw compressed passthrough is reserved for untrimmed clips so trimmed cuts always start cleanly on an IDR frame.
-      let usePassthrough = !isTrimmed && (quality == "passthrough" && canPassthroughCodec)
+      // Raw compressed passthrough is reserved for untrimmed 1x clips so trimmed/speed-scaled cuts re-encode cleanly.
+      let usePassthrough = !isTrimmed && !hasSpeedChange && (quality == "passthrough" && canPassthroughCodec)
 
       let readerVideoOutput: AVAssetReaderTrackOutput
       let writerVideoInput: AVAssetWriterInput
 
       if usePassthrough {
-        readerVideoOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
+        readerVideoOutput = AVAssetReaderTrackOutput(track: readerVideoTrack, outputSettings: nil)
         writerVideoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: sourceFormatDesc)
         writerVideoInput.transform = videoTrack.preferredTransform
       } else {
         readerVideoOutput = AVAssetReaderTrackOutput(
-          track: videoTrack,
+          track: readerVideoTrack,
           outputSettings: [
             kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
           ]
@@ -680,36 +765,59 @@ import CoreLocation
       reader.add(readerVideoOutput)
       writer.add(writerVideoInput)
 
-      // 4. Optional audio track
-      var readerAudioOutput: AVAssetReaderTrackOutput?
+      // 4. Optional audio track (uses AVAssetReaderAudioMixOutput for pitch-preserving speed scaling)
+      var readerAudioOutput: AVAssetReaderOutput?
       var writerAudioInput: AVAssetWriterInput?
-      if keepAudio, let audioTrack = asset.tracks(withMediaType: .audio).first {
-        let audioOut = AVAssetReaderTrackOutput(
-          track: audioTrack,
-          outputSettings: [
-            AVFormatIDKey: kAudioFormatLinearPCM,
-            AVLinearPCMBitDepthKey: 16,
-            AVLinearPCMIsBigEndianKey: false,
-            AVLinearPCMIsFloatKey: false,
-            AVLinearPCMIsNonInterleaved: false
-          ]
-        )
-        audioOut.alwaysCopiesSampleData = false
-        let audioIn = AVAssetWriterInput(
-          mediaType: .audio,
-          outputSettings: [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVNumberOfChannelsKey: 2,
-            AVSampleRateKey: 44100,
-            AVEncoderBitRateKey: 128000
-          ]
-        )
-        audioIn.expectsMediaDataInRealTime = false
-        if reader.canAdd(audioOut) && writer.canAdd(audioIn) {
-          reader.add(audioOut)
-          writer.add(audioIn)
-          readerAudioOutput = audioOut
-          writerAudioInput = audioIn
+      if keepAudio {
+        let audioInSettings: [String: Any] = [
+          AVFormatIDKey: kAudioFormatMPEG4AAC,
+          AVNumberOfChannelsKey: 2,
+          AVSampleRateKey: 44100,
+          AVEncoderBitRateKey: 128000
+        ]
+        let pcmOutSettings: [String: Any] = [
+          AVFormatIDKey: kAudioFormatLinearPCM,
+          AVSampleRateKey: 44100,
+          AVNumberOfChannelsKey: 2,
+          AVLinearPCMBitDepthKey: 16,
+          AVLinearPCMIsBigEndianKey: false,
+          AVLinearPCMIsFloatKey: false,
+          AVLinearPCMIsNonInterleaved: false
+        ]
+
+        let createdAudioOutput: AVAssetReaderOutput?
+        if hasSpeedChange {
+          if let compAudioTrack = compositionAudioTrack {
+            let mixOut = AVAssetReaderAudioMixOutput(
+              audioTracks: [compAudioTrack],
+              audioSettings: pcmOutSettings
+            )
+            mixOut.audioTimePitchAlgorithm = (safeSpeed > 2.0 || safeSpeed < 0.5) ? .spectral : .timeDomain
+            mixOut.alwaysCopiesSampleData = false
+            createdAudioOutput = mixOut
+          } else {
+            createdAudioOutput = nil
+          }
+        } else if let audioTrack = asset.tracks(withMediaType: .audio).first {
+          let trackOut = AVAssetReaderTrackOutput(
+            track: audioTrack,
+            outputSettings: pcmOutSettings
+          )
+          trackOut.alwaysCopiesSampleData = false
+          createdAudioOutput = trackOut
+        } else {
+          createdAudioOutput = nil
+        }
+
+        if let audioOut = createdAudioOutput {
+          let audioIn = AVAssetWriterInput(mediaType: .audio, outputSettings: audioInSettings)
+          audioIn.expectsMediaDataInRealTime = false
+          if reader.canAdd(audioOut) && writer.canAdd(audioIn) {
+            reader.add(audioOut)
+            writer.add(audioIn)
+            readerAudioOutput = audioOut
+            writerAudioInput = audioIn
+          }
         }
       }
 
@@ -725,11 +833,11 @@ import CoreLocation
         return
       }
 
-      // CRITICAL: Match startSession to trimRange.start so trimmed sample buffer PTS align at 0s in output MOV.
-      let sessionStartTime = isTrimmed ? trimRange.start : CMTime.zero
+      // CRITICAL: Match startSession to trimRange.start on 1x trimmed runs; scaled compositions always start at 0s.
+      let sessionStartTime = (!hasSpeedChange && isTrimmed) ? trimRange.start : CMTime.zero
       writer.startSession(atSourceTime: sessionStartTime)
 
-      // Write still-image-time marker in the same source timeline
+      // Write still-image-time marker in the same timeline
       let stillItem = AVMutableMetadataItem()
       stillItem.key = "com.apple.quicktime.still-image-time" as NSString
       stillItem.keySpace = .quickTimeMetadata
@@ -743,6 +851,11 @@ import CoreLocation
       let pumpGroup = DispatchGroup()
       let videoQueue = DispatchQueue(label: "com.longlive.videoPump")
       var lastReportedPercent = -1
+      var lastAppendedVideoPts: CMTime = .invalid
+      let maxOutputFps: Double = safeSpeed >= 3.0 ? 30.0 : 60.0
+      let minFrameDeltaSec: Double = (safeSpeed > 1.01) ? (1.0 / maxOutputFps) * 0.92 : 0.0
+      let progressOriginSec = hasSpeedChange ? 0.0 : trimStartSec
+      let progressSpanSec = max(outputSpanSec, 0.1)
 
       pumpGroup.enter()
       writerVideoInput.requestMediaDataWhenReady(on: videoQueue) { [weak self] in
@@ -754,17 +867,36 @@ import CoreLocation
           }
           if let sample = readerVideoOutput.copyNextSampleBuffer() {
             let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+            if lastAppendedVideoPts.isValid {
+              if CMTimeCompare(pts, lastAppendedVideoPts) <= 0 {
+                continue
+              }
+              if minFrameDeltaSec > 0.0 {
+                let deltaSec = CMTimeGetSeconds(CMTimeSubtract(pts, lastAppendedVideoPts))
+                if deltaSec.isFinite && deltaSec < minFrameDeltaSec {
+                  continue
+                }
+              }
+            }
+
             let sec = CMTimeGetSeconds(pts)
-            if sec.isFinite && trimDurationSec > 0 {
-              let ratio = min(max((sec - trimStartSec) / trimDurationSec, 0.0), 1.0)
+            if sec.isFinite {
+              let ratio = min(max((sec - progressOriginSec) / progressSpanSec, 0.0), 1.0)
               let uiProg = 0.12 + ratio * 0.82
               let pct = Int(ratio * 100.0)
               if pct >= lastReportedPercent + 2 {
                 lastReportedPercent = pct
-                let modeLabel = usePassthrough ? "原画直通封装中" : "硬件编码压制中"
+                let modeLabel: String
+                if hasSpeedChange {
+                  modeLabel = "\(self?.formatSpeedTag(safeSpeed) ?? "倍速")压制中"
+                } else {
+                  modeLabel = usePassthrough ? "原画直通封装中" : "硬件编码压制中"
+                }
                 self?.emitProgress(stage: "video", progress: uiProg, message: "\(modeLabel)（\(pct)%）...")
               }
             }
+
+            lastAppendedVideoPts = pts
             if !writerVideoInput.append(sample) {
               writerVideoInput.markAsFinished()
               pumpGroup.leave()

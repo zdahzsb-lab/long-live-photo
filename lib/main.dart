@@ -10,10 +10,13 @@ import 'package:material_ui/material_ui.dart';
 import 'package:video_player/video_player.dart';
 
 import 'constants/app_branding.dart';
+import 'models/conversion_history.dart';
 import 'models/conversion_options.dart';
+import 'services/conversion_history_store.dart';
 import 'services/live_photo_channel.dart';
 import 'theme/ui_tokens.dart';
 import 'ui/buttons.dart';
+import 'ui/history_drawer_sheet.dart';
 import 'ui/pressable.dart';
 import 'ui/result_sheet.dart';
 import 'ui/segmented_tabs.dart';
@@ -39,17 +42,21 @@ class LongLivePhotoApp extends StatelessWidget {
   const LongLivePhotoApp({
     super.key,
     this.gateway,
+    this.historyStore,
     this.debugInitialController,
     this.debugInitialVideoPath,
     this.debugInitialSizeBytes = 0,
     this.debugInitialCustomCoverPath,
+    this.debugFileExistsChecker,
   });
 
   final LivePhotoConverterGateway? gateway;
+  final ConversionHistoryStore? historyStore;
   final VideoPlayerController? debugInitialController;
   final String? debugInitialVideoPath;
   final int debugInitialSizeBytes;
   final String? debugInitialCustomCoverPath;
+  final Future<bool> Function(String path)? debugFileExistsChecker;
 
   @override
   Widget build(BuildContext context) {
@@ -66,10 +73,12 @@ class LongLivePhotoApp extends StatelessWidget {
       },
       home: ConverterHomePage(
         gateway: gateway ?? NativeLivePhotoChannel(),
+        historyStore: historyStore,
         initialController: debugInitialController,
         initialVideoPath: debugInitialVideoPath,
         initialSizeBytes: debugInitialSizeBytes,
         initialCustomCoverPath: debugInitialCustomCoverPath,
+        fileExistsChecker: debugFileExistsChecker,
       ),
     );
   }
@@ -79,17 +88,21 @@ class ConverterHomePage extends StatefulWidget {
   const ConverterHomePage({
     super.key,
     required this.gateway,
+    this.historyStore,
     this.initialController,
     this.initialVideoPath,
     this.initialSizeBytes = 0,
     this.initialCustomCoverPath,
+    this.fileExistsChecker,
   });
 
   final LivePhotoConverterGateway gateway;
+  final ConversionHistoryStore? historyStore;
   final VideoPlayerController? initialController;
   final String? initialVideoPath;
   final int initialSizeBytes;
   final String? initialCustomCoverPath;
+  final Future<bool> Function(String path)? fileExistsChecker;
 
   @override
   State<ConverterHomePage> createState() => _ConverterHomePageState();
@@ -97,6 +110,10 @@ class ConverterHomePage extends StatefulWidget {
 
 class _ConverterHomePageState extends State<ConverterHomePage> {
   final ImagePicker _imagePicker = ImagePicker();
+  late final ConversionHistoryStore _historyStore;
+  List<ConversionHistoryEntry> _historyEntries =
+      const <ConversionHistoryEntry>[];
+  int _historySeq = 0;
 
   VideoPlayerController? _videoController;
   bool _ownsController = false;
@@ -114,6 +131,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
   int _trimEndMs = 0;
 
   QualityPreset _quality = QualityPreset.p1080;
+  PlaybackSpeedPreset _playbackSpeed = PlaybackSpeedPreset.normal;
   bool _keepAudio = true;
   bool _preserveMetadata = true;
 
@@ -126,6 +144,9 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
   @override
   void initState() {
     super.initState();
+    _historyStore = widget.historyStore ?? FileConversionHistoryStore();
+    unawaited(_loadHistory());
+
     final seeded = widget.initialController;
     if (seeded != null && seeded.value.isInitialized) {
       _videoController = seeded;
@@ -349,7 +370,128 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     }
   }
 
-  Future<void> _loadVideoFile(String path) async {
+  Future<void> _loadHistory() async {
+    final entries = await _historyStore.load();
+    if (mounted) {
+      setState(() => _historyEntries = entries);
+    }
+  }
+
+  Future<bool> _checkFileExists(String path) async {
+    if (path.isEmpty) return false;
+    final checker = widget.fileExistsChecker;
+    if (checker != null) {
+      return checker(path);
+    }
+    return File(path).exists();
+  }
+
+  Future<void> _applyPlaybackSpeed(double rate) async {
+    final ctrl = _videoController;
+    if (ctrl == null) return;
+    try {
+      await ctrl.setPlaybackSpeed(rate);
+    } catch (_) {
+      // Ignore if controller implementation rejects playback speed updates.
+    }
+  }
+
+  void _setPlaybackSpeed(PlaybackSpeedPreset preset) {
+    if (_isConverting || preset == _playbackSpeed) return;
+    setState(() => _playbackSpeed = preset);
+    unawaited(_applyPlaybackSpeed(preset.rate));
+  }
+
+  Future<void> _openHistoryDrawer() async {
+    if (_isConverting) return;
+    await showHistoryDrawerSheet(
+      context: context,
+      initialEntries: _historyEntries,
+      onDeleteEntry: (String id) async {
+        final next = await _historyStore.removeById(id);
+        if (mounted) {
+          setState(() => _historyEntries = next);
+        }
+        return next;
+      },
+      onClearAll: () async {
+        await _historyStore.clear();
+        if (mounted) {
+          setState(() => _historyEntries = const <ConversionHistoryEntry>[]);
+        }
+      },
+      onSelectEntry: (ConversionHistoryEntry entry) {
+        unawaited(_restoreFromHistoryEntry(entry));
+      },
+    );
+  }
+
+  Future<void> _restoreFromHistoryEntry(ConversionHistoryEntry entry) async {
+    if (_isConverting) return;
+    final videoExists = await _checkFileExists(entry.sourceVideoPath);
+    if (!mounted) return;
+    if (!videoExists) {
+      _showMessage('原视频文件已移除，无法重新载入');
+      return;
+    }
+
+    if (_selectedVideoPath == entry.sourceVideoPath &&
+        _videoController != null &&
+        _videoController!.value.isInitialized) {
+      final ctrl = _videoController!;
+      final totalMs = _videoDuration.inMilliseconds;
+      final restoredRange = entry.wasTrimmed
+          ? VideoTrimMath.clampTrimRange(
+              startMs: entry.trimStartMs ?? 0,
+              endMs: entry.trimEndMs ?? totalMs,
+              totalMs: totalMs,
+            )
+          : (startMs: 0, endMs: totalMs);
+      final restoredCoverMs = VideoTrimMath.clampCoverToTrim(
+        coverMs: entry.coverTimeMs,
+        startMs: restoredRange.startMs,
+        endMs: restoredRange.endMs,
+      );
+      String? restoredCustomCover;
+      if (entry.customCoverPath != null && entry.customCoverPath!.isNotEmpty) {
+        if (await _checkFileExists(entry.customCoverPath!)) {
+          restoredCustomCover = entry.customCoverPath;
+        }
+      }
+      if (!mounted) return;
+
+      final restoredSpeed = entry.speedPreset;
+      final restoredAudio = entry.keepAudio;
+      if (ctrl.value.isPlaying) {
+        await ctrl.pause();
+      }
+      await ctrl.setVolume(restoredAudio ? 1.0 : 0.0);
+      await ctrl.seekTo(Duration(milliseconds: restoredCoverMs));
+      await _applyPlaybackSpeed(restoredSpeed.rate);
+      if (!mounted) return;
+
+      setState(() {
+        _quality = entry.quality;
+        _playbackSpeed = restoredSpeed;
+        _keepAudio = restoredAudio;
+        _preserveMetadata = entry.preserveMetadata;
+        _trimStartMs = restoredRange.startMs;
+        _trimEndMs = restoredRange.endMs;
+        _coverTimeMs = restoredCoverMs;
+        _currentPosition = Duration(milliseconds: restoredCoverMs);
+        _customCoverPath = restoredCustomCover;
+      });
+      _showMessage('已恢复上次合成参数', isError: false);
+      return;
+    }
+
+    await _loadVideoFile(entry.sourceVideoPath, restoredEntry: entry);
+  }
+
+  Future<void> _loadVideoFile(
+    String path, {
+    ConversionHistoryEntry? restoredEntry,
+  }) async {
     setState(() {
       _isLoadingVideo = true;
       _thumbnails = const <Uint8List>[];
@@ -364,13 +506,48 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
       final size = await file.length();
       final ctrl = VideoPlayerController.file(file);
       await ctrl.initialize();
-      await ctrl.setVolume(_keepAudio ? 1.0 : 0.0);
-      ctrl.addListener(_onVideoTick);
 
       final totalMs = ctrl.value.duration.inMilliseconds;
+      final restoredSpeed =
+          restoredEntry?.speedPreset ?? PlaybackSpeedPreset.normal;
+      final restoredAudio = restoredEntry?.keepAudio ?? _keepAudio;
+      final restoredQuality = restoredEntry?.quality ?? _quality;
+      final restoredMetadata =
+          restoredEntry?.preserveMetadata ?? _preserveMetadata;
+
+      final trimRange = (restoredEntry != null && restoredEntry.wasTrimmed)
+          ? VideoTrimMath.clampTrimRange(
+              startMs: restoredEntry.trimStartMs ?? 0,
+              endMs: restoredEntry.trimEndMs ?? totalMs,
+              totalMs: totalMs,
+            )
+          : (startMs: 0, endMs: totalMs);
+
       final defaultCoverMs = totalMs > 600 ? 500 : 0;
-      if (defaultCoverMs > 0) {
-        await ctrl.seekTo(Duration(milliseconds: defaultCoverMs));
+      final targetCoverMs = restoredEntry != null
+          ? VideoTrimMath.clampCoverToTrim(
+              coverMs: restoredEntry.coverTimeMs,
+              startMs: trimRange.startMs,
+              endMs: trimRange.endMs,
+            )
+          : defaultCoverMs;
+
+      String? restoredCustomCover;
+      if (restoredEntry?.customCoverPath != null &&
+          restoredEntry!.customCoverPath!.isNotEmpty) {
+        if (await _checkFileExists(restoredEntry.customCoverPath!)) {
+          restoredCustomCover = restoredEntry.customCoverPath;
+        }
+      }
+
+      await ctrl.setVolume(restoredAudio ? 1.0 : 0.0);
+      try {
+        await ctrl.setPlaybackSpeed(restoredSpeed.rate);
+      } catch (_) {
+        // Ignore if platform player rejects playback speed on init.
+      }
+      if (targetCoverMs > 0) {
+        await ctrl.seekTo(Duration(milliseconds: targetCoverMs));
       }
 
       if (!mounted) {
@@ -378,20 +555,29 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
         return;
       }
 
+      ctrl.addListener(_onVideoTick);
       setState(() {
         _videoController = ctrl;
         _ownsController = true;
         _selectedVideoPath = path;
-        _customCoverPath = null;
+        _customCoverPath = restoredCustomCover;
         _sourceSizeBytes = size;
         _videoDuration = ctrl.value.duration;
-        _currentPosition = Duration(milliseconds: defaultCoverMs);
-        _trimStartMs = 0;
-        _trimEndMs = totalMs;
-        _coverTimeMs = defaultCoverMs;
+        _currentPosition = Duration(milliseconds: targetCoverMs);
+        _trimStartMs = trimRange.startMs;
+        _trimEndMs = trimRange.endMs;
+        _coverTimeMs = targetCoverMs;
+        _quality = restoredQuality;
+        _playbackSpeed = restoredSpeed;
+        _keepAudio = restoredAudio;
+        _preserveMetadata = restoredMetadata;
         _isLiveHolding = false;
         _isLoadingVideo = false;
       });
+
+      if (restoredEntry != null) {
+        _showMessage('已载入历史素材与参数', isError: false);
+      }
 
       unawaited(_loadThumbnails(path));
     } catch (e) {
@@ -494,6 +680,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     playHaptic(Haptic.light);
     _wasPlayingBeforeHold = ctrl.value.isPlaying;
     setState(() => _isLiveHolding = true);
+    await _applyPlaybackSpeed(_playbackSpeed.rate);
     await ctrl.seekTo(Duration(milliseconds: _trimStartMs));
     await ctrl.play();
     if (mounted) setState(() {});
@@ -527,6 +714,16 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     await widget.gateway.cancelConversion();
   }
 
+  Uint8List? _pickThumbnailBytesForCover(int coverMs, int totalMs) {
+    if (_thumbnails.isEmpty) return null;
+    if (_thumbnails.length == 1 || totalMs <= 0) return _thumbnails.first;
+    final ratio = (coverMs / totalMs).clamp(0.0, 1.0);
+    final idx = (ratio * (_thumbnails.length - 1))
+        .round()
+        .clamp(0, _thumbnails.length - 1);
+    return _thumbnails[idx];
+  }
+
   Future<void> _startConversion() async {
     final path = _selectedVideoPath;
     if (path == null || _isConverting) return;
@@ -545,6 +742,11 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     final effectiveDuration = isTrimmed
         ? Duration(milliseconds: (_trimEndMs - _trimStartMs).clamp(0, totalMs))
         : _videoDuration;
+    final speed = _playbackSpeed;
+    final outputDuration = VideoSpeedMath.scaledDuration(
+      effectiveDuration,
+      speed.rate,
+    );
 
     setState(() {
       _isConverting = true;
@@ -566,6 +768,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
         trimStartMs: isTrimmed ? _trimStartMs : null,
         trimEndMs: isTrimmed ? _trimEndMs : null,
         preserveMetadata: _preserveMetadata,
+        playbackSpeed: speed.rate,
       );
 
       if (!mounted) return;
@@ -575,10 +778,49 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
         _progress = null;
       });
 
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      _historySeq++;
+      final entry = ConversionHistoryEntry(
+        id: '${nowMs}_$_historySeq',
+        createdAtMs: nowMs,
+        sourceVideoPath: path,
+        savedTarget: result.savedTarget,
+        platformFormat: result.platformFormat,
+        sourceDurationMs: effectiveDuration.inMilliseconds,
+        outputDurationMs: outputDuration.inMilliseconds,
+        outputSizeBytes: result.outputSizeBytes,
+        elapsedMs: result.elapsedMs,
+        qualityWireValue: _quality.wireValue,
+        playbackSpeed: speed.rate,
+        keepAudio: _keepAudio,
+        preserveMetadata: _preserveMetadata,
+        wasTrimmed: isTrimmed,
+        trimStartMs: isTrimmed ? _trimStartMs : null,
+        trimEndMs: isTrimmed ? _trimEndMs : null,
+        coverTimeMs: _coverTimeMs,
+        customCoverPath: _customCoverPath,
+      );
+      final thumbBytes = _customCoverPath == null
+          ? _pickThumbnailBytesForCover(_coverTimeMs, totalMs)
+          : null;
+      try {
+        final updated = await _historyStore.add(
+          entry,
+          thumbnailBytes: thumbBytes,
+        );
+        if (mounted) {
+          setState(() => _historyEntries = updated);
+        }
+      } catch (_) {
+        // Never block result feedback if local history persistence fails.
+      }
+
+      if (!mounted) return;
       await showConversionResultSheet(
         context: context,
-        duration: effectiveDuration,
+        duration: outputDuration,
         result: result,
+        playbackSpeed: speed,
       );
     } on PlatformException catch (e) {
       if (!mounted) return;
@@ -645,15 +887,50 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
                           ),
                         ),
                         const Spacer(),
-                        if (hasVideo)
-                          PillAction(
+                        if (hasVideo && scaledPx > 18.0) ...<Widget>[
+                          IconAction(
+                            key: const Key('history_drawer_button'),
+                            icon: LucideIcons.history,
+                            filled: true,
+                            size: 17,
+                            semanticLabel: '打开合成历史记录抽屉',
+                            enabled: !_isConverting,
+                            onTap: _openHistoryDrawer,
+                          ),
+                          const SizedBox(width: 6),
+                          IconAction(
                             key: const Key('replace_video_button'),
-                            label: '更换',
-                            semanticLabel: '更换视频素材',
                             icon: LucideIcons.arrowLeftRight,
+                            filled: true,
+                            size: 17,
+                            semanticLabel: '更换视频素材',
                             enabled: !_isConverting,
                             onTap: _openSourceSheet,
                           ),
+                        ] else ...<Widget>[
+                          PillAction(
+                            key: const Key('history_drawer_button'),
+                            label: _historyEntries.isEmpty
+                                ? '记录'
+                                : '记录 ${_historyEntries.length}',
+                            semanticLabel: '打开合成历史记录抽屉',
+                            icon: LucideIcons.history,
+                            emphasized: _historyEntries.isNotEmpty,
+                            enabled: !_isConverting,
+                            onTap: _openHistoryDrawer,
+                          ),
+                          if (hasVideo) ...<Widget>[
+                            const SizedBox(width: 6),
+                            PillAction(
+                              key: const Key('replace_video_button'),
+                              label: '更换',
+                              semanticLabel: '更换视频素材',
+                              icon: LucideIcons.arrowLeftRight,
+                              enabled: !_isConverting,
+                              onTap: _openSourceSheet,
+                            ),
+                          ],
+                        ],
                       ],
                     ),
                   ),
@@ -666,7 +943,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
                       final horizontalPad =
                           constraints.maxWidth >= 500 ? 24.0 : 18.0;
                       final isCompact =
-                          constraints.maxHeight < 520 || scaledPx > 18.0;
+                          constraints.maxHeight < 560 || scaledPx > 18.0;
 
                       final content = AnimatedSwitcher(
                         duration: Ui.motion(context, Ui.base),
@@ -745,11 +1022,16 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
         ? Duration(milliseconds: trimmedSpanMs)
         : _videoDuration;
 
+    final outputDuration = VideoSpeedMath.scaledDuration(
+      effectiveDuration,
+      _playbackSpeed.rate,
+    );
     final estimatedBytes = _quality.estimateOutputBytes(
       sourceSizeBytes: _sourceSizeBytes,
       duration: effectiveDuration,
       totalDuration: _videoDuration,
       keepAudio: _keepAudio,
+      playbackSpeed: _playbackSpeed.rate,
     );
 
     final pct = ((_progress?.progress ?? 0.0) * 100).round().clamp(0, 100);
@@ -767,6 +1049,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
       customCoverPath: _customCoverPath,
       trimStartMs: _trimStartMs,
       trimEndMs: _trimEndMs,
+      playbackSpeed: _playbackSpeed.rate,
       isLivePreviewing: _isLiveHolding,
       onTogglePlay: _togglePlay,
       onToggleAudio: _toggleAudio,
@@ -775,9 +1058,25 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
       onLiveHoldEnd: _onLiveHoldEnd,
     );
 
-    final subtitleText = estimatedBytes > 0
-        ? '${_quality.subtitle} · 约 ${formatFileSize(estimatedBytes)}'
-        : _quality.subtitle;
+    final String subtitleText;
+    if (_playbackSpeed.isModified) {
+      final durationTag =
+          '${_playbackSpeed.shortTag} ${formatPreciseDuration(outputDuration)}';
+      final prefix = _quality == QualityPreset.passthrough
+          ? '原画重编码（$durationTag）'
+          : '${_quality.segmentLabel} · $durationTag';
+      subtitleText = estimatedBytes > 0
+          ? '$prefix · 约 ${formatFileSize(estimatedBytes)}'
+          : prefix;
+    } else {
+      subtitleText = estimatedBytes > 0
+          ? '${_quality.subtitle} · 约 ${formatFileSize(estimatedBytes)}'
+          : _quality.subtitle;
+    }
+
+    final speedRoleLabel = _playbackSpeed.rate > 2.5
+        ? '延时'
+        : (_playbackSpeed.rate < 0.99 ? '慢放' : '倍速');
 
     return Column(
       key: const ValueKey<String>('state_editor'),
@@ -788,7 +1087,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
           Expanded(child: stage)
         else
           SizedBox(height: 250, child: stage),
-        const SizedBox(height: Ui.s2 + 2),
+        const SizedBox(height: Ui.s2),
 
         // 1. Filmstrip Cover + Trim Range Scrubber
         FilmstripScrubber(
@@ -805,9 +1104,56 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
           onTrimChanged: _onTrimChanged,
           onResetTrim: _resetTrim,
         ),
-        const SizedBox(height: Ui.s3),
+        const SizedBox(height: Ui.s2),
 
-        // 2. Minimalist Sliding Quality Tabs
+        // 2. Live Speed / Timelapse Strip (0.5x – 4x)
+        Row(
+          children: <Widget>[
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                if (_playbackSpeed.isModified) ...<Widget>[
+                  Container(
+                    width: 5.5,
+                    height: 5.5,
+                    decoration: const BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: Ui.liveActive,
+                    ),
+                  ),
+                  const SizedBox(width: 5),
+                ],
+                Text(
+                  speedRoleLabel,
+                  style: Ui.caption.copyWith(
+                    color: _playbackSpeed.isModified
+                        ? Ui.textPrimary
+                        : Ui.textSecondary,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(width: Ui.s2),
+            Expanded(
+              child: SegmentedTabs<PlaybackSpeedPreset>(
+                key: const Key('speed_segmented_tabs'),
+                items: PlaybackSpeedPreset.values,
+                selectedIndex: _playbackSpeed.index,
+                height: 36,
+                fontSize: 12.5,
+                monospace: true,
+                enabled: !_isConverting,
+                labelBuilder: (PlaybackSpeedPreset p) => p.label,
+                onChanged: (int index) {
+                  _setPlaybackSpeed(PlaybackSpeedPreset.values[index]);
+                },
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: Ui.s1 + 2),
+
+        // 3. Minimalist Sliding Quality Tabs
         SegmentedTabs<QualityPreset>(
           key: const Key('quality_segmented_tabs'),
           items: QualityPreset.values,

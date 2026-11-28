@@ -18,11 +18,15 @@ import android.os.Looper
 import android.provider.MediaStore
 import androidx.annotation.OptIn
 import androidx.exifinterface.media.ExifInterface
+import androidx.media3.common.C
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.audio.SpeedProvider
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.effect.FrameDropEffect
 import androidx.media3.effect.Presentation
+import androidx.media3.effect.SpeedChangeEffect
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.DefaultEncoderFactory
 import androidx.media3.transformer.EditedMediaItem
@@ -46,8 +50,10 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToLong
 
 data class NativeConversionOutcome(
     val savedUri: String,
@@ -93,10 +99,12 @@ class MotionPhotoConverter(
         trimStartMs: Long? = null,
         trimEndMs: Long? = null,
         preserveMetadata: Boolean = true,
+        playbackSpeed: Double = 1.0,
         onSuccess: (NativeConversionOutcome) -> Unit,
         onError: (code: String, message: String) -> Unit,
     ) {
         cancelled.set(false)
+        val safeSpeed = playbackSpeed.coerceIn(0.5, 4.0)
         workerExecutor.execute {
             val startTime = System.currentTimeMillis()
             val inputFile = File(videoPath)
@@ -151,8 +159,10 @@ class MotionPhotoConverter(
                     trimStartMs = inspection.safeTrimStartMs,
                     trimEndMs = inspection.safeTrimEndMs,
                     isTrimmed = inspection.isTrimmed,
+                    hasAudioTrack = inspection.hasAudioTrack,
                     quality = quality,
                     keepAudio = keepAudio,
+                    playbackSpeed = safeSpeed,
                 )
 
                 ensureNotCancelled()
@@ -162,7 +172,9 @@ class MotionPhotoConverter(
                 }
 
                 emitProgress("packaging", 0.94, "正在注入双标准实况 XMP 元数据并写入相册...")
-                val relativeCoverMs = (inspection.clampedCoverMs - inspection.safeTrimStartMs)
+                val relativeCoverMs = ((inspection.clampedCoverMs - inspection.safeTrimStartMs)
+                    .coerceAtLeast(0L).toDouble() / safeSpeed)
+                    .roundToLong()
                     .coerceAtLeast(0L)
                 val coverTimestampUs = relativeCoverMs * 1000L
 
@@ -231,10 +243,37 @@ class MotionPhotoConverter(
         val safeTrimStartMs: Long,
         val safeTrimEndMs: Long,
         val isTrimmed: Boolean,
+        val hasAudioTrack: Boolean,
         val clampedCoverMs: Long,
         val captureTimeMs: Long?,
         val location: Pair<Double, Double>?,
     )
+
+    private fun detectHasAudioTrack(
+        inputFile: File,
+        retriever: MediaMetadataRetriever,
+    ): Boolean {
+        val extractor = MediaExtractor()
+        return try {
+            extractor.setDataSource(inputFile.absolutePath)
+            var found = false
+            for (i in 0 until extractor.trackCount) {
+                val mime = extractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME)
+                if (mime != null && mime.startsWith("audio/")) {
+                    found = true
+                    break
+                }
+            }
+            found
+        } catch (_: Exception) {
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO) == "yes"
+        } finally {
+            try {
+                extractor.release()
+            } catch (_: Exception) {
+            }
+        }
+    }
 
     private fun inspectSourceVideo(
         inputFile: File,
@@ -253,6 +292,7 @@ class MotionPhotoConverter(
                 ?.toIntOrNull() ?: 1920
             val durationMs = (retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                 ?.toLongOrNull() ?: 1000L).coerceAtLeast(100L)
+            val hasAudioTrack = detectHasAudioTrack(inputFile, retriever)
 
             val rawStart = (trimStartMs ?: 0L).coerceIn(0L, max(0L, durationMs - 100L))
             var rawEnd = (trimEndMs ?: durationMs).coerceIn(100L, durationMs)
@@ -293,6 +333,7 @@ class MotionPhotoConverter(
                 safeTrimStartMs = safeTrimStartMs,
                 safeTrimEndMs = safeTrimEndMs,
                 isTrimmed = isTrimmed,
+                hasAudioTrack = hasAudioTrack,
                 clampedCoverMs = clampedCoverMs,
                 captureTimeMs = captureTimeMs,
                 location = location,
@@ -520,6 +561,16 @@ class MotionPhotoConverter(
         return Pair(lat, lon)
     }
 
+    private fun formatSpeedTag(speed: Double): String {
+        return when {
+            abs(speed - 0.5) < 0.05 -> "0.5x 慢放"
+            abs(speed - 1.5) < 0.05 -> "1.5x 倍速"
+            abs(speed - 2.0) < 0.05 -> "2x 倍速"
+            abs(speed - 4.0) < 0.05 -> "4x 延时"
+            else -> String.format(Locale.US, "%.1fx 倍速", speed)
+        }
+    }
+
     private fun prepareMp4Trailer(
         inputFile: File,
         tempMp4File: File,
@@ -529,10 +580,15 @@ class MotionPhotoConverter(
         trimStartMs: Long,
         trimEndMs: Long,
         isTrimmed: Boolean,
+        hasAudioTrack: Boolean,
         quality: String,
         keepAudio: Boolean,
+        playbackSpeed: Double,
     ): File {
-        if (!isTrimmed && quality == "passthrough") {
+        val safeSpeed = playbackSpeed.coerceIn(0.5, 4.0)
+        val hasSpeedChange = abs(safeSpeed - 1.0) > 0.01
+
+        if (!isTrimmed && !hasSpeedChange && quality == "passthrough") {
             val remuxOk = tryLosslessRemuxToMp4(inputFile, tempMp4File, keepAudio)
             ensureNotCancelled()
             if (remuxOk && tempMp4File.exists() && tempMp4File.length() > 0L) {
@@ -550,8 +606,10 @@ class MotionPhotoConverter(
             trimStartMs = trimStartMs,
             trimEndMs = trimEndMs,
             isTrimmed = isTrimmed,
+            hasAudioTrack = hasAudioTrack,
             quality = quality,
             keepAudio = keepAudio,
+            playbackSpeed = safeSpeed,
         )
         return tempMp4File
     }
@@ -672,12 +730,18 @@ class MotionPhotoConverter(
         trimStartMs: Long,
         trimEndMs: Long,
         isTrimmed: Boolean,
+        hasAudioTrack: Boolean,
         quality: String,
         keepAudio: Boolean,
+        playbackSpeed: Double,
     ) {
         val latch = CountDownLatch(1)
         activeLatch = latch
         val errorRef = AtomicReference<Exception?>(null)
+
+        val safeSpeed = playbackSpeed.coerceIn(0.5, 4.0)
+        val hasSpeedChange = abs(safeSpeed - 1.0) > 0.01
+        val keepActualAudio = keepAudio && hasAudioTrack
 
         val (targetShortSide, targetBitrate) = when (quality) {
             "720p" -> Pair(720, 2_800_000)
@@ -692,6 +756,14 @@ class MotionPhotoConverter(
             }
             try {
                 val videoEffects = mutableListOf<Effect>()
+                if (hasSpeedChange && !keepActualAudio) {
+                    // Pure GL speed scaling avoids SpeedChangingAudioProcessor waiting on absent audio frames.
+                    videoEffects.add(SpeedChangeEffect(safeSpeed.toFloat()))
+                }
+                if (hasSpeedChange && safeSpeed > 1.01) {
+                    val targetFps = if (safeSpeed >= 3.0) 30f else 60f
+                    videoEffects.add(FrameDropEffect.createDefaultFrameDropEffect(targetFps))
+                }
                 val srcShortSide = min(srcWidth, srcHeight)
                 if (srcShortSide > targetShortSide) {
                     videoEffects.add(Presentation.createForShortSide(targetShortSide))
@@ -709,10 +781,19 @@ class MotionPhotoConverter(
                     )
                 }
 
-                val editedItem = EditedMediaItem.Builder(mediaItemBuilder.build())
-                    .setRemoveAudio(!keepAudio)
+                val editedItemBuilder = EditedMediaItem.Builder(mediaItemBuilder.build())
+                    .setRemoveAudio(!keepActualAudio)
                     .setEffects(Effects(emptyList(), videoEffects))
-                    .build()
+
+                if (hasSpeedChange && keepActualAudio) {
+                    val speedFloat = safeSpeed.toFloat()
+                    editedItemBuilder.setSpeed(object : SpeedProvider {
+                        override fun getSpeed(timeUs: Long): Float = speedFloat
+                        override fun getNextSpeedChangeTimeUs(timeUs: Long): Long = C.TIME_UNSET
+                    })
+                }
+
+                val editedItem = editedItemBuilder.build()
 
                 val videoEncoderSettings = VideoEncoderSettings.Builder()
                     .setBitrate(targetBitrate)
@@ -725,6 +806,11 @@ class MotionPhotoConverter(
                 lateinit var transformer: Transformer
                 val progressHolder = ProgressHolder()
                 var finished = false
+                val progressPrefix = if (hasSpeedChange) {
+                    "${formatSpeedTag(safeSpeed)}压制中"
+                } else {
+                    "硬件编码压制中"
+                }
 
                 val pollRunnable = object : Runnable {
                     override fun run() {
@@ -733,7 +819,7 @@ class MotionPhotoConverter(
                         if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
                             val pct = progressHolder.progress.coerceIn(0, 100)
                             val uiProg = 0.12 + (pct / 100.0) * 0.80
-                            onProgress("video", uiProg, "硬件编码压制中（$pct%）...")
+                            onProgress("video", uiProg, "$progressPrefix（$pct%）...")
                         }
                         mainHandler.postDelayed(this, 200L)
                     }
