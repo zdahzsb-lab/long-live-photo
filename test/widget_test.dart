@@ -6,11 +6,15 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:long_live_photo/constants/app_branding.dart';
 import 'package:long_live_photo/main.dart';
+import 'package:long_live_photo/models/app_preferences.dart';
+import 'package:long_live_photo/models/batch_task.dart';
 import 'package:long_live_photo/models/conversion_history.dart';
 import 'package:long_live_photo/models/conversion_options.dart';
+import 'package:long_live_photo/services/app_preferences_store.dart';
 import 'package:long_live_photo/services/conversion_history_store.dart';
 import 'package:long_live_photo/services/live_photo_channel.dart';
 import 'package:long_live_photo/ui/buttons.dart';
+import 'package:long_live_photo/ui/minimal_bottom_nav.dart';
 import 'package:long_live_photo/utils/motion_photo_spec.dart';
 import 'package:long_live_photo/widgets/filmstrip_scrubber.dart';
 import 'package:material_ui/material_ui.dart';
@@ -506,10 +510,71 @@ void main() {
         contains('GCamera:MotionPhotoPresentationTimestampUs="1250000"'),
       );
     });
+
+    test('AppPreferences JSON & FileAppPreferencesStore persist defaults and tolerate corruption', () async {
+      final tempRoot = Directory.systemTemp.createTempSync('unclip_prefs_test_');
+      addTearDown(() {
+        if (tempRoot.existsSync()) {
+          tempRoot.deleteSync(recursive: true);
+        }
+      });
+
+      final store = FileAppPreferencesStore(
+        baseDirProvider: () async => tempRoot,
+      );
+      expect(await store.load(), AppPreferences.defaults);
+
+      const custom = AppPreferences(
+        defaultQuality: QualityPreset.passthrough,
+        defaultKeepAudio: false,
+        defaultPreserveMetadata: false,
+        defaultBatchCover: BatchCoverStrategy.firstFrame,
+      );
+      await store.save(custom);
+
+      final reloaded = FileAppPreferencesStore(
+        baseDirProvider: () async => tempRoot,
+      );
+      expect(await reloaded.load(), custom);
+
+      final prefsFile = File(
+        '${tempRoot.path}${Platform.pathSeparator}unclip_prefs${Platform.pathSeparator}preferences.json',
+      );
+      await prefsFile.writeAsString('{broken-json');
+      expect(await reloaded.load(), AppPreferences.defaults);
+
+      final histStore = FileConversionHistoryStore(
+        baseDirProvider: () async => tempRoot,
+      );
+      expect(await histStore.calculateStorageBytes(), 0);
+      await histStore.add(
+        ConversionHistoryEntry(
+          id: 'size_check',
+          createdAtMs: 1700000000000,
+          sourceVideoPath: '/tmp/a.mp4',
+          savedTarget: 'content://media/1',
+          platformFormat: 'Motion Photo',
+          sourceDurationMs: 5000,
+          outputDurationMs: 5000,
+          outputSizeBytes: 1024,
+          elapsedMs: 500,
+          qualityWireValue: '1080p',
+          playbackSpeed: 1.0,
+          keepAudio: true,
+          preserveMetadata: true,
+          wasTrimmed: false,
+          coverTimeMs: 500,
+        ),
+        thumbnailBytes: Uint8List.fromList(<int>[0xFF, 0xD8, 0xAA, 0xFF, 0xD9]),
+      );
+      expect(await histStore.calculateStorageBytes(), greaterThan(0));
+      await histStore.clear();
+      expect(await histStore.calculateStorageBytes(), 0);
+    });
   });
 
   testWidgets(
-    'Welcome & Editor screens render without overflow across 375x667, landscape, and 1.4x Dynamic Type',
+    '3-tab shell & full-screen Editor render without overflow across 375x667, landscape, and 1.4x Dynamic Type',
     (WidgetTester tester) async {
       final gateway = _ControllableGateway();
       final fakeCtrl = _FakeVideoController();
@@ -520,34 +585,56 @@ void main() {
         tester.view.resetDevicePixelRatio();
       });
 
-      // 1. Small phone portrait welcome screen (375x667)
+      // 1. Small phone portrait 3-tab shell (375x667) + 1.4x Dynamic Type
       tester.view.physicalSize = const Size(375 * 3, 667 * 3);
       tester.view.devicePixelRatio = 3.0;
 
-      await tester.pumpWidget(
-        LongLivePhotoApp(
-          gateway: gateway,
-          historyStore: InMemoryConversionHistoryStore(),
-        ),
-      );
-      await tester.pumpAndSettle();
-
-      expect(find.text(AppBranding.appName), findsOneWidget);
-      expect(find.text('长视频转实况照片'), findsOneWidget);
-      expect(find.text('从相册选视频'), findsOneWidget);
-      expect(find.byKey(const Key('history_drawer_button')), findsOneWidget);
-
-      for (final rt in tester.widgetList<RichText>(find.byType(RichText))) {
-        expect(rt.text.style?.decoration, isNot(equals(TextDecoration.underline)));
-      }
-
-      // 2. Small phone portrait editor screen (375x667) + 1.4x Dynamic Type
       await tester.pumpWidget(
         MediaQuery(
           data: const MediaQueryData(textScaler: TextScaler.linear(1.4)),
           child: LongLivePhotoApp(
             gateway: gateway,
             historyStore: InMemoryConversionHistoryStore(),
+            preferencesStore: InMemoryAppPreferencesStore(),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(tester.takeException(), isNull);
+      expect(find.text(AppBranding.appName), findsOneWidget);
+      expect(find.text('长视频转实况照片'), findsOneWidget);
+      expect(find.byKey(const Key('pick_gallery_button')), findsOneWidget);
+      expect(find.byKey(const Key('pick_file_button')), findsOneWidget);
+      expect(find.byType(MinimalBottomNav), findsOneWidget);
+      expect(find.byKey(const Key('pick_batch_button')), findsNothing);
+      expect(find.byKey(const Key('pick_live_unpack_button')), findsNothing);
+
+      await tester.tap(find.byKey(const Key('nav_tab_tools')));
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+      expect(find.byKey(const Key('pick_batch_button')), findsOneWidget);
+      expect(find.byKey(const Key('pick_live_unpack_button')), findsOneWidget);
+
+      await tester.tap(find.byKey(const Key('nav_tab_settings')));
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+      expect(find.text('默认合成偏好'), findsOneWidget);
+      expect(find.byKey(const Key('settings_default_quality')), findsOneWidget);
+
+      for (final rt in tester.widgetList<RichText>(find.byType(RichText))) {
+        expect(rt.text.style?.decoration, isNot(equals(TextDecoration.underline)));
+      }
+
+      // 2. Small phone portrait full-screen editor (375x667) + 1.4x Dynamic Type
+      await tester.pumpWidget(
+        MediaQuery(
+          data: const MediaQueryData(textScaler: TextScaler.linear(1.4)),
+          child: LongLivePhotoApp(
+            key: const ValueKey<String>('editor_portrait'),
+            gateway: gateway,
+            historyStore: InMemoryConversionHistoryStore(),
+            preferencesStore: InMemoryAppPreferencesStore(),
             debugInitialController: fakeCtrl,
             debugInitialVideoPath: 'mock://clip.mp4',
             debugInitialSizeBytes: 32 * 1024 * 1024,
@@ -556,6 +643,8 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
+      expect(find.byType(MinimalBottomNav), findsNothing);
+      expect(find.byKey(const Key('editor_back_button')), findsOneWidget);
       expect(find.byKey(const Key('custom_cover_button')), findsOneWidget);
       expect(find.byKey(const Key('preserve_metadata_toggle')), findsOneWidget);
       expect(find.byKey(const Key('speed_segmented_tabs')), findsOneWidget);
@@ -568,6 +657,7 @@ void main() {
           child: LongLivePhotoApp(
             gateway: gateway,
             historyStore: InMemoryConversionHistoryStore(),
+            preferencesStore: InMemoryAppPreferencesStore(),
             debugInitialController: fakeCtrl,
             debugInitialVideoPath: 'mock://clip.mp4',
             debugInitialSizeBytes: 32 * 1024 * 1024,
@@ -576,6 +666,7 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
+      expect(find.byType(MinimalBottomNav), findsNothing);
     },
   );
 
@@ -825,16 +916,15 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('已存入系统相册'), findsNothing);
 
-      // Header history badge updated to 1
-      expect(find.text('记录 1'), findsOneWidget);
-
-      // Reset parameters to 1x + 1080p, then restore from history drawer
+      // Reset parameters to 1x + 1080p, then restore via replace->history sheet
       await tester.tap(find.text('1x'));
       await tester.tap(find.text('1080p 均衡'));
       await tester.pumpAndSettle();
       expect(fakeCtrl.lastPlaybackSpeed, 1.0);
 
-      await tester.tap(find.byKey(const Key('history_drawer_button')));
+      await tester.tap(find.byKey(const Key('replace_video_button')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('sheet_open_history')));
       await tester.pumpAndSettle();
       expect(find.text('合成记录'), findsOneWidget);
 
@@ -845,11 +935,20 @@ void main() {
 
       expect(fakeCtrl.lastPlaybackSpeed, 4.0);
       expect(find.text('已恢复上次合成参数'), findsOneWidget);
+
+      // Exiting editor restores 3-tab bottom bar and Tools tab displays the saved history entry
+      await tester.tap(find.byKey(const Key('editor_back_button')));
+      await tester.pumpAndSettle();
+      expect(find.byType(MinimalBottomNav), findsOneWidget);
+
+      await tester.tap(find.byKey(const Key('nav_tab_tools')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(Key('history_entry_${recorded.first.id}')), findsOneWidget);
     },
   );
 
   testWidgets(
-    'History drawer handles empty state, missing-file notice, single delete, and 2-step clear all',
+    'Tools tab history handles empty state, missing-file notice, single delete, and 2-step clear all',
     (WidgetTester tester) async {
       final gateway = _ControllableGateway();
       final missingEntry = ConversionHistoryEntry(
@@ -906,24 +1005,21 @@ void main() {
         LongLivePhotoApp(
           gateway: gateway,
           historyStore: store,
+          preferencesStore: InMemoryAppPreferencesStore(),
           debugFileExistsChecker: (_) async => false,
         ),
       );
       await tester.pumpAndSettle();
 
-      expect(find.text('记录 2'), findsOneWidget);
-      await tester.tap(find.byKey(const Key('history_drawer_button')));
+      await tester.tap(find.byKey(const Key('nav_tab_tools')));
       await tester.pumpAndSettle();
 
-      // Tapping entry whose source file is gone closes drawer & shows friendly toast
+      // Tapping entry whose source file is gone shows friendly toast
       await tester.tap(find.byKey(const Key('history_entry_missing_1')));
       await tester.pumpAndSettle();
       expect(find.text('原视频文件已移除，无法重新载入'), findsOneWidget);
 
-      // Re-open, delete one entry, then 2-step confirm clear all
-      await tester.tap(find.byKey(const Key('history_drawer_button')));
-      await tester.pumpAndSettle();
-
+      // Delete one entry, then 2-step confirm clear all
       await tester.tap(find.byKey(const Key('history_delete_missing_1')));
       await tester.pumpAndSettle();
       expect(find.byKey(const Key('history_entry_missing_1')), findsNothing);
@@ -1130,7 +1226,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.tap(find.byKey(const Key('history_drawer_button')));
+      await tester.tap(find.byKey(const Key('replace_video_button')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('sheet_open_history')));
       await tester.pumpAndSettle();
       await tester.tap(find.byKey(Key('history_entry_${entry.id}')));
       await tester.pumpAndSettle();
@@ -1175,6 +1273,7 @@ void main() {
         LongLivePhotoApp(
           gateway: gateway,
           historyStore: historyStore,
+          preferencesStore: InMemoryAppPreferencesStore(),
           debugControllerBuilder: (String path) {
             final ctrl = _FakeVideoController(
               duration: const Duration(seconds: 12),
@@ -1188,9 +1287,12 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      // 1. Welcome screen unpacks Live Photo directly into editor
+      // 1. Switch to Tools tab and unpack Live Photo directly into full-screen editor
+      await tester.tap(find.byKey(const Key('nav_tab_tools')));
+      await tester.pumpAndSettle();
       await tester.tap(find.byKey(const Key('pick_live_unpack_button')));
       await tester.pumpAndSettle();
+      expect(find.byType(MinimalBottomNav), findsNothing);
       expect(find.byKey(const Key('export_tools_button')), findsOneWidget);
       expect(find.textContaining('已拆解实况照片'), findsOneWidget);
 
@@ -1263,7 +1365,11 @@ void main() {
 
       await tester.tap(find.byKey(const Key('batch_done_button')));
       await tester.pumpAndSettle();
-      expect(find.text('记录 2'), findsOneWidget);
+
+      await tester.tap(find.byKey(const Key('editor_back_button')));
+      await tester.pumpAndSettle();
+      expect(find.byType(MinimalBottomNav), findsOneWidget);
+      expect(find.text('2'), findsOneWidget);
 
       // 6. Mid-batch cancellation cancels current + remaining items cleanly
       gateway.autoCompleteConversions = false;
@@ -1334,6 +1440,7 @@ void main() {
           child: LongLivePhotoApp(
             gateway: gateway,
             historyStore: InMemoryConversionHistoryStore(entries),
+            preferencesStore: InMemoryAppPreferencesStore(),
             debugInitialController: fakeCtrl,
             debugInitialVideoPath: 'mock://clip.mp4',
             debugInitialSizeBytes: 20 * 1024 * 1024,
@@ -1342,7 +1449,128 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
+      expect(find.byType(MinimalBottomNav), findsNothing);
+      expect(find.byKey(const Key('editor_back_button')), findsOneWidget);
       expect(find.byKey(const Key('export_tools_button')), findsOneWidget);
+      expect(find.byKey(const Key('replace_video_button')), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    '3-tab navigation, Settings persistence, default application to new videos, and cache clearing',
+    (WidgetTester tester) async {
+      final gateway = _ControllableGateway();
+      final prefsStore = InMemoryAppPreferencesStore();
+      final existingEntry = ConversionHistoryEntry(
+        id: 'cached_1',
+        createdAtMs: DateTime.now().millisecondsSinceEpoch,
+        sourceVideoPath: 'mock://old.mp4',
+        savedTarget: 'mock://saved/old',
+        platformFormat: 'Motion Photo',
+        sourceDurationMs: 10000,
+        outputDurationMs: 10000,
+        outputSizeBytes: 2 * 1024 * 1024,
+        elapsedMs: 900,
+        qualityWireValue: '1080p',
+        playbackSpeed: 1.0,
+        keepAudio: true,
+        preserveMetadata: true,
+        wasTrimmed: false,
+        coverTimeMs: 500,
+      );
+      final historyStore =
+          InMemoryConversionHistoryStore(<ConversionHistoryEntry>[existingEntry]);
+      final controllers = <_FakeVideoController>[];
+
+      addTearDown(() {
+        gateway.dispose();
+        for (final c in controllers) {
+          c.dispose();
+        }
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      tester.view.physicalSize = const Size(390 * 3, 844 * 3);
+      tester.view.devicePixelRatio = 3.0;
+
+      await tester.pumpWidget(
+        LongLivePhotoApp(
+          gateway: gateway,
+          historyStore: historyStore,
+          preferencesStore: prefsStore,
+          debugControllerBuilder: (String path) {
+            final ctrl = _FakeVideoController(
+              duration: const Duration(seconds: 10),
+              position: Duration.zero,
+            );
+            controllers.add(ctrl);
+            return ctrl;
+          },
+          debugFileSizeReader: (_) async => 8 * 1024 * 1024,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Home shows only 2 actions + minimalist bottom nav
+      expect(find.byType(MinimalBottomNav), findsOneWidget);
+      expect(find.byKey(const Key('pick_gallery_button')), findsOneWidget);
+      expect(find.byKey(const Key('pick_file_button')), findsOneWidget);
+      expect(find.byKey(const Key('pick_batch_button')), findsNothing);
+      expect(find.byKey(const Key('pick_live_unpack_button')), findsNothing);
+
+      // Switch to Settings & customize all defaults
+      await tester.tap(find.byKey(const Key('nav_tab_settings')));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('原画秒转'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('settings_default_audio')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('settings_default_metadata')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('首帧封面'));
+      await tester.pumpAndSettle();
+
+      final savedPrefs = await prefsStore.load();
+      expect(savedPrefs.defaultQuality, QualityPreset.passthrough);
+      expect(savedPrefs.defaultKeepAudio, isFalse);
+      expect(savedPrefs.defaultPreserveMetadata, isFalse);
+      expect(savedPrefs.defaultBatchCover, BatchCoverStrategy.firstFrame);
+
+      // Open a fresh video -> full-screen editor applies Settings defaults & hides bottom nav
+      gateway.sharedMediaController.add(const <SharedMediaItem>[
+        SharedMediaItem(
+          path: 'mock://fresh_clip.mp4',
+          kind: SharedMediaKind.video,
+        ),
+      ]);
+      await tester.pumpAndSettle();
+
+      expect(find.byType(MinimalBottomNav), findsNothing);
+      expect(find.text('已静音'), findsOneWidget);
+      expect(find.text('当前时间'), findsOneWidget);
+      expect(find.textContaining('保留原片码率'), findsOneWidget);
+
+      // Navigate back out of editor -> bottom bar returns
+      await tester.tap(find.byKey(const Key('editor_back_button')));
+      await tester.pumpAndSettle();
+      expect(find.byType(MinimalBottomNav), findsOneWidget);
+
+      // Clear history from Settings tab (2-step confirmation)
+      await tester.tap(find.byKey(const Key('nav_tab_settings')));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('1 条记录'), findsOneWidget);
+
+      final clearBtn = find.byKey(const Key('settings_clear_history_button'));
+      await tester.ensureVisible(clearBtn);
+      await tester.tap(clearBtn);
+      await tester.pumpAndSettle();
+      expect(find.text('确认清空'), findsOneWidget);
+
+      await tester.tap(clearBtn);
+      await tester.pumpAndSettle();
+      expect(find.text('暂无本地缓存'), findsOneWidget);
     },
   );
 }

@@ -18,6 +18,8 @@ abstract class ConversionHistoryStore {
   Future<List<ConversionHistoryEntry>> removeById(String id);
 
   Future<void> clear();
+
+  Future<int> calculateStorageBytes();
 }
 
 /// JSON + thumbnail file-backed history repository capped at [maxEntries].
@@ -246,6 +248,33 @@ class FileConversionHistoryStore implements ConversionHistoryStore {
       // Ignore cleanup errors.
     }
   }
+
+  @override
+  Future<int> calculateStorageBytes() async {
+    try {
+      final root = await _rootDir();
+      var total = 0;
+      final file = _historyFile(root);
+      if (await file.exists()) {
+        total += await file.length();
+      }
+      final thumbs = await _thumbsDir(root);
+      if (await thumbs.exists()) {
+        await for (final entity in thumbs.list()) {
+          if (entity is File) {
+            try {
+              total += await entity.length();
+            } catch (_) {
+              // Ignore disappearing temp files.
+            }
+          }
+        }
+      }
+      return total;
+    } catch (_) {
+      return 0;
+    }
+  }
 }
 
 class InMemoryConversionHistoryStore implements ConversionHistoryStore {
@@ -292,5 +321,17 @@ class InMemoryConversionHistoryStore implements ConversionHistoryStore {
   @override
   Future<void> clear() async {
     _entries.clear();
+  }
+
+  @override
+  Future<int> calculateStorageBytes() async {
+    if (_entries.isEmpty) return 0;
+    var total = 0;
+    for (final entry in _entries) {
+      total += (entry.thumbnailPath != null && entry.thumbnailPath!.isNotEmpty)
+          ? 128 * 1024
+          : 4 * 1024;
+    }
+    return total;
   }
 }

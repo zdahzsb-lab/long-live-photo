@@ -246,7 +246,7 @@ class _HistoryDrawerContentState extends State<_HistoryDrawerContent> {
                     separatorBuilder: (_, _) => const SizedBox(height: Ui.s2),
                     itemBuilder: (BuildContext context, int index) {
                       final entry = _entries[index];
-                      return _HistoryEntryTile(
+                      return HistoryEntryTile(
                         entry: entry,
                         enabled: !_busy,
                         onTap: () => widget.onSelectEntry(entry),
@@ -263,18 +263,21 @@ class _HistoryDrawerContentState extends State<_HistoryDrawerContent> {
   }
 }
 
-class _HistoryEntryTile extends StatelessWidget {
-  const _HistoryEntryTile({
+class HistoryEntryTile extends StatelessWidget {
+  const HistoryEntryTile({
+    super.key,
     required this.entry,
     required this.enabled,
     required this.onTap,
     required this.onDelete,
+    this.surfaceColor = Ui.bg,
   });
 
   final ConversionHistoryEntry entry;
   final bool enabled;
   final VoidCallback onTap;
   final VoidCallback onDelete;
+  final Color surfaceColor;
 
   @override
   Widget build(BuildContext context) {
@@ -303,7 +306,7 @@ class _HistoryEntryTile extends StatelessWidget {
             child: Container(
               padding: const EdgeInsets.all(Ui.s2 + 2),
               decoration: BoxDecoration(
-                color: Ui.bg,
+                color: surfaceColor,
                 borderRadius: BorderRadius.circular(Ui.rMd),
                 border: Border.all(color: Ui.hairline),
               ),

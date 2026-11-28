@@ -10,20 +10,25 @@ import 'package:material_ui/material_ui.dart';
 import 'package:video_player/video_player.dart';
 
 import 'constants/app_branding.dart';
+import 'models/app_preferences.dart';
 import 'models/batch_task.dart';
 import 'models/conversion_history.dart';
 import 'models/conversion_options.dart';
+import 'services/app_preferences_store.dart';
 import 'services/conversion_history_store.dart';
 import 'services/live_photo_channel.dart';
 import 'theme/ui_tokens.dart';
 import 'ui/batch_queue_sheet.dart';
 import 'ui/buttons.dart';
 import 'ui/history_drawer_sheet.dart';
+import 'ui/minimal_bottom_nav.dart';
 import 'ui/pressable.dart';
 import 'ui/result_sheet.dart';
 import 'ui/segmented_tabs.dart';
 import 'widgets/empty_studio_view.dart';
 import 'widgets/filmstrip_scrubber.dart';
+import 'widgets/settings_view.dart';
+import 'widgets/tools_history_view.dart';
 import 'widgets/video_stage_card.dart';
 
 void main() {
@@ -45,6 +50,7 @@ class LongLivePhotoApp extends StatelessWidget {
     super.key,
     this.gateway,
     this.historyStore,
+    this.preferencesStore,
     this.debugInitialController,
     this.debugInitialVideoPath,
     this.debugInitialSizeBytes = 0,
@@ -56,6 +62,7 @@ class LongLivePhotoApp extends StatelessWidget {
 
   final LivePhotoConverterGateway? gateway;
   final ConversionHistoryStore? historyStore;
+  final AppPreferencesStore? preferencesStore;
   final VideoPlayerController? debugInitialController;
   final String? debugInitialVideoPath;
   final int debugInitialSizeBytes;
@@ -80,6 +87,7 @@ class LongLivePhotoApp extends StatelessWidget {
       home: ConverterHomePage(
         gateway: gateway ?? NativeLivePhotoChannel(),
         historyStore: historyStore,
+        preferencesStore: preferencesStore,
         initialController: debugInitialController,
         initialVideoPath: debugInitialVideoPath,
         initialSizeBytes: debugInitialSizeBytes,
@@ -97,6 +105,7 @@ class ConverterHomePage extends StatefulWidget {
     super.key,
     required this.gateway,
     this.historyStore,
+    this.preferencesStore,
     this.initialController,
     this.initialVideoPath,
     this.initialSizeBytes = 0,
@@ -108,6 +117,7 @@ class ConverterHomePage extends StatefulWidget {
 
   final LivePhotoConverterGateway gateway;
   final ConversionHistoryStore? historyStore;
+  final AppPreferencesStore? preferencesStore;
   final VideoPlayerController? initialController;
   final String? initialVideoPath;
   final int initialSizeBytes;
@@ -123,9 +133,15 @@ class ConverterHomePage extends StatefulWidget {
 class _ConverterHomePageState extends State<ConverterHomePage> {
   final ImagePicker _imagePicker = ImagePicker();
   late final ConversionHistoryStore _historyStore;
+  late final AppPreferencesStore _preferencesStore;
   List<ConversionHistoryEntry> _historyEntries =
       const <ConversionHistoryEntry>[];
+  int _historyStorageBytes = 0;
   int _historySeq = 0;
+  int _loadToken = 0;
+
+  StudioTab _activeTab = StudioTab.home;
+  AppPreferences _preferences = AppPreferences.defaults;
 
   VideoPlayerController? _videoController;
   bool _ownsController = false;
@@ -154,10 +170,16 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
   bool _wasPlayingBeforeHold = false;
   ConversionProgress? _progress;
 
+  bool get _inEditorMode =>
+      _isLoadingVideo ||
+      (_videoController != null && _videoController!.value.isInitialized);
+
   @override
   void initState() {
     super.initState();
     _historyStore = widget.historyStore ?? FileConversionHistoryStore();
+    _preferencesStore = widget.preferencesStore ?? FileAppPreferencesStore();
+    unawaited(_loadPreferences());
     unawaited(_loadHistory());
 
     final seeded = widget.initialController;
@@ -227,6 +249,17 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     if (Platform.isIOS) return 'Apple Live Photo · 原生直入系统照片';
     if (Platform.isAndroid) return 'Android 动态照片 · 双标准兼容各大品牌相册';
     return 'Studio 预览模式';
+  }
+
+  String get _platformFormatSummary {
+    if (kIsWeb) return 'Web 预览模式';
+    if (Platform.isIOS) {
+      return 'Apple Live Photo · .pvt 实况包 · HDR → SDR 色调映射';
+    }
+    if (Platform.isAndroid) {
+      return '双标准 Motion Photo · 三星动态照片 · HDR → SDR 色调映射';
+    }
+    return '桌面预览模式';
   }
 
   void _showMessage(String msg, {bool isError = true}) {
@@ -352,13 +385,15 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
       initialItems: items,
       gateway: widget.gateway,
       historyStore: _historyStore,
-      initialQuality: _quality,
-      initialSpeed: _playbackSpeed,
-      initialKeepAudio: _keepAudio,
-      initialPreserveMetadata: _preserveMetadata,
+      initialQuality: _preferences.defaultQuality,
+      initialSpeed: PlaybackSpeedPreset.normal,
+      initialKeepAudio: _preferences.defaultKeepAudio,
+      initialPreserveMetadata: _preferences.defaultPreserveMetadata,
+      initialCoverStrategy: _preferences.defaultBatchCover,
       onHistoryUpdated: (List<ConversionHistoryEntry> updated) {
         if (mounted) {
           setState(() => _historyEntries = updated);
+          unawaited(_refreshHistoryBytes());
         }
       },
       onOpenGallery: (String? savedTarget) =>
@@ -442,10 +477,10 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
                 ),
                 const SizedBox(height: Ui.s2 + 2),
                 SecondaryButton(
-                  key: const Key('sheet_pick_batch'),
-                  label: '批量多选转换',
-                  icon: LucideIcons.layers,
-                  onTap: () => Navigator.of(sheetContext).pop('batch'),
+                  key: const Key('sheet_pick_files'),
+                  label: '从文件管理器导入',
+                  icon: LucideIcons.folderOpen,
+                  onTap: () => Navigator.of(sheetContext).pop('files'),
                 ),
                 const SizedBox(height: Ui.s2 + 2),
                 SecondaryButton(
@@ -456,10 +491,10 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
                 ),
                 const SizedBox(height: Ui.s2 + 2),
                 SecondaryButton(
-                  key: const Key('sheet_pick_files'),
-                  label: '从文件管理器导入',
-                  icon: LucideIcons.folderOpen,
-                  onTap: () => Navigator.of(sheetContext).pop('files'),
+                  key: const Key('sheet_open_history'),
+                  label: '从历史记录套用 / 载入',
+                  icon: LucideIcons.history,
+                  onTap: () => Navigator.of(sheetContext).pop('history'),
                 ),
               ],
             ),
@@ -471,12 +506,12 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     if (!mounted || choice == null) return;
     if (choice == 'gallery') {
       await _pickFromGallery();
-    } else if (choice == 'batch') {
-      await _pickBatchVideos();
-    } else if (choice == 'unpack') {
-      await _pickAndUnpackLivePhoto();
     } else if (choice == 'files') {
       await _pickFromFiles();
+    } else if (choice == 'unpack') {
+      await _pickAndUnpackLivePhoto();
+    } else if (choice == 'history') {
+      await _openHistoryDrawer();
     }
   }
 
@@ -696,10 +731,69 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     }
   }
 
+  Future<void> _loadPreferences() async {
+    final prefs = await _preferencesStore.load();
+    if (!mounted) return;
+    setState(() {
+      _preferences = prefs;
+      if (!_inEditorMode && widget.initialController == null) {
+        _quality = prefs.defaultQuality;
+        _keepAudio = prefs.defaultKeepAudio;
+        _preserveMetadata = prefs.defaultPreserveMetadata;
+      }
+    });
+  }
+
+  void _updatePreferences(AppPreferences next) {
+    setState(() {
+      _preferences = next;
+      if (!_inEditorMode) {
+        _quality = next.defaultQuality;
+        _keepAudio = next.defaultKeepAudio;
+        _preserveMetadata = next.defaultPreserveMetadata;
+      }
+    });
+    unawaited(_preferencesStore.save(next));
+  }
+
   Future<void> _loadHistory() async {
     final entries = await _historyStore.load();
+    final bytes = await _historyStore.calculateStorageBytes();
     if (mounted) {
-      setState(() => _historyEntries = entries);
+      setState(() {
+        _historyEntries = entries;
+        _historyStorageBytes = bytes;
+      });
+    }
+  }
+
+  Future<void> _refreshHistoryBytes() async {
+    final bytes = await _historyStore.calculateStorageBytes();
+    if (mounted) {
+      setState(() => _historyStorageBytes = bytes);
+    }
+  }
+
+  Future<List<ConversionHistoryEntry>> _deleteHistoryEntry(String id) async {
+    final next = await _historyStore.removeById(id);
+    final bytes = await _historyStore.calculateStorageBytes();
+    if (mounted) {
+      setState(() {
+        _historyEntries = next;
+        _historyStorageBytes = bytes;
+      });
+    }
+    return next;
+  }
+
+  Future<void> _clearAllHistory() async {
+    await _historyStore.clear();
+    final bytes = await _historyStore.calculateStorageBytes();
+    if (mounted) {
+      setState(() {
+        _historyEntries = const <ConversionHistoryEntry>[];
+        _historyStorageBytes = bytes;
+      });
     }
   }
 
@@ -756,19 +850,8 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     await showHistoryDrawerSheet(
       context: context,
       initialEntries: _historyEntries,
-      onDeleteEntry: (String id) async {
-        final next = await _historyStore.removeById(id);
-        if (mounted) {
-          setState(() => _historyEntries = next);
-        }
-        return next;
-      },
-      onClearAll: () async {
-        await _historyStore.clear();
-        if (mounted) {
-          setState(() => _historyEntries = const <ConversionHistoryEntry>[]);
-        }
-      },
+      onDeleteEntry: _deleteHistoryEntry,
+      onClearAll: _clearAllHistory,
       onSelectEntry: (ConversionHistoryEntry entry) {
         unawaited(_restoreFromHistoryEntry(entry));
       },
@@ -869,12 +952,54 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     await _loadVideoFile(entry.sourceVideoPath, restoredEntry: entry);
   }
 
+  Future<void> _closeEditor() async {
+    if (_isConverting) return;
+    _loadToken++;
+    final oldController = _videoController;
+    final oldOwned = _ownsController;
+    oldController?.removeListener(_onVideoTick);
+    if (oldController != null && oldController.value.isPlaying) {
+      try {
+        await oldController.pause();
+      } catch (_) {
+        // Ignore pause errors during teardown.
+      }
+    }
+    try {
+      if (!mounted) return;
+      setState(() {
+        _videoController = null;
+        _ownsController = false;
+        _selectedVideoPath = null;
+        _customCoverPath = null;
+        _sourceSizeBytes = 0;
+        _thumbnails = const <Uint8List>[];
+        _videoDuration = Duration.zero;
+        _currentPosition = Duration.zero;
+        _coverTimeMs = 0;
+        _trimStartMs = 0;
+        _trimEndMs = 0;
+        _isLiveHolding = false;
+        _isLoadingVideo = false;
+        _quality = _preferences.defaultQuality;
+        _playbackSpeed = PlaybackSpeedPreset.normal;
+        _keepAudio = _preferences.defaultKeepAudio;
+        _preserveMetadata = _preferences.defaultPreserveMetadata;
+      });
+    } finally {
+      if (oldOwned) {
+        await oldController?.dispose();
+      }
+    }
+  }
+
   Future<void> _loadVideoFile(
     String path, {
     ConversionHistoryEntry? restoredEntry,
     int? initialCoverTimeMs,
     String? customToast,
   }) async {
+    final token = ++_loadToken;
     setState(() {
       _isLoadingVideo = true;
       _thumbnails = const <Uint8List>[];
@@ -895,13 +1020,22 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
         await ctrl.initialize();
       }
 
+      if (!mounted || token != _loadToken) {
+        if (ownsNewController) {
+          await ctrl.dispose();
+        }
+        return;
+      }
+
       final totalMs = ctrl.value.duration.inMilliseconds;
       final restoredSpeed =
           restoredEntry?.speedPreset ?? PlaybackSpeedPreset.normal;
-      final restoredAudio = restoredEntry?.keepAudio ?? _keepAudio;
-      final restoredQuality = restoredEntry?.quality ?? _quality;
+      final restoredAudio =
+          restoredEntry?.keepAudio ?? _preferences.defaultKeepAudio;
+      final restoredQuality =
+          restoredEntry?.quality ?? _preferences.defaultQuality;
       final restoredMetadata =
-          restoredEntry?.preserveMetadata ?? _preserveMetadata;
+          restoredEntry?.preserveMetadata ?? _preferences.defaultPreserveMetadata;
 
       final trimRange = (restoredEntry != null && restoredEntry.wasTrimmed)
           ? VideoTrimMath.clampTrimRange(
@@ -940,7 +1074,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
         await ctrl.seekTo(Duration(milliseconds: targetCoverMs));
       }
 
-      if (!mounted) {
+      if (!mounted || token != _loadToken) {
         if (ownsNewController) {
           await ctrl.dispose();
         }
@@ -975,7 +1109,7 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
 
       unawaited(_loadThumbnails(path));
     } catch (e) {
-      if (mounted) {
+      if (mounted && token == _loadToken) {
         setState(() {
           _videoController = null;
           _ownsController = false;
@@ -1203,8 +1337,12 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
           thumbnailBytes: thumbBytes,
           customCoverSourcePath: _customCoverPath,
         );
+        final bytes = await _historyStore.calculateStorageBytes();
         if (mounted) {
-          setState(() => _historyEntries = updated);
+          setState(() {
+            _historyEntries = updated;
+            _historyStorageBytes = bytes;
+          });
         }
       } catch (_) {
         // Never block result feedback if local history persistence fails.
@@ -1248,168 +1386,53 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
   Widget build(BuildContext context) {
     final ctrl = _videoController;
     final hasVideo = ctrl != null && ctrl.value.isInitialized;
+    final inEditor = _inEditorMode;
     final scaledPx = MediaQuery.textScalerOf(context).scale(14.0);
 
-    return Scaffold(
-      backgroundColor: Ui.bg,
-      body: SafeArea(
-        child: Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 560),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: <Widget>[
-                // Minimalist Top Header — strictly separated from stage
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(Ui.s5, Ui.s1, Ui.s4, Ui.s1),
-                  child: SizedBox(
-                    height: 44,
-                    child: Row(
-                      children: <Widget>[
-                        Expanded(
-                          child: Row(
-                            children: <Widget>[
-                              const Flexible(
-                                child: Text(
-                                  AppBranding.appName,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: Ui.wordmark,
-                                ),
-                              ),
-                              if (!hasVideo && scaledPx <= 16.0) ...<Widget>[
-                                const SizedBox(width: Ui.s2),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 7,
-                                    vertical: 2,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: Ui.surface,
-                                    borderRadius: BorderRadius.circular(6),
-                                    border: Border.all(color: Ui.hairline),
-                                  ),
-                                  child: Text(
-                                    'LIVE',
-                                    style: Ui.mono.copyWith(
-                                      fontSize: 10.5,
-                                      letterSpacing: 0.6,
-                                      color: Ui.textSecondary,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ],
-                          ),
-                        ),
-                        const SizedBox(width: Ui.s2),
-                        if (hasVideo && scaledPx > 15.5) ...<Widget>[
-                          IconAction(
-                            key: const Key('history_drawer_button'),
-                            icon: LucideIcons.history,
-                            filled: true,
-                            size: 17,
-                            semanticLabel: '打开合成历史记录抽屉',
-                            enabled: !_isConverting,
-                            onTap: _openHistoryDrawer,
-                          ),
-                          const SizedBox(width: 4),
-                          IconAction(
-                            key: const Key('export_tools_button'),
-                            icon: LucideIcons.share,
-                            filled: true,
-                            size: 17,
-                            semanticLabel: '导出纯视频或高清封面',
-                            enabled: !_isConverting,
-                            onTap: _openExportToolsSheet,
-                          ),
-                          const SizedBox(width: 4),
-                          IconAction(
-                            key: const Key('replace_video_button'),
-                            icon: LucideIcons.arrowLeftRight,
-                            filled: true,
-                            size: 17,
-                            semanticLabel: '更换视频素材',
-                            enabled: !_isConverting,
-                            onTap: _openSourceSheet,
-                          ),
-                        ] else ...<Widget>[
-                          PillAction(
-                            key: const Key('history_drawer_button'),
-                            label: _historyEntries.isEmpty
-                                ? '记录'
-                                : '记录 ${_historyEntries.length}',
-                            semanticLabel: '打开合成历史记录抽屉',
-                            icon: LucideIcons.history,
-                            emphasized: _historyEntries.isNotEmpty,
-                            enabled: !_isConverting,
-                            onTap: _openHistoryDrawer,
-                          ),
-                          if (hasVideo) ...<Widget>[
-                            const SizedBox(width: 4),
-                            IconAction(
-                              key: const Key('export_tools_button'),
-                              icon: LucideIcons.share,
-                              filled: true,
-                              size: 17,
-                              semanticLabel: '导出纯视频或高清封面',
-                              enabled: !_isConverting,
-                              onTap: _openExportToolsSheet,
-                            ),
-                            const SizedBox(width: 4),
-                            PillAction(
-                              key: const Key('replace_video_button'),
-                              label: '更换',
-                              semanticLabel: '更换视频素材',
-                              icon: LucideIcons.arrowLeftRight,
-                              enabled: !_isConverting,
-                              onTap: _openSourceSheet,
-                            ),
-                          ],
-                        ],
-                      ],
-                    ),
+    return PopScope(
+      canPop: !inEditor,
+      onPopInvokedWithResult: (bool didPop, Object? _) {
+        if (!didPop && inEditor && !_isConverting) {
+          unawaited(_closeEditor());
+        }
+      },
+      child: Scaffold(
+        backgroundColor: Ui.bg,
+        bottomNavigationBar: inEditor
+            ? null
+            : MinimalBottomNav(
+                currentTab: _activeTab,
+                enabled: !_isConverting,
+                onChanged: (StudioTab tab) {
+                  if (_activeTab != tab) {
+                    setState(() => _activeTab = tab);
+                  }
+                },
+              ),
+        body: SafeArea(
+          bottom: inEditor,
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 560),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  _buildTopHeader(
+                    inEditor: inEditor,
+                    hasVideo: hasVideo,
+                    scaledPx: scaledPx,
                   ),
-                ),
-
-                // Main Studio Body
-                Expanded(
-                  child: LayoutBuilder(
-                    builder: (BuildContext context, BoxConstraints constraints) {
-                      final horizontalPad =
-                          constraints.maxWidth >= 500 ? 24.0 : 18.0;
-                      final isCompact =
-                          constraints.maxHeight < 560 || scaledPx > 18.0;
-
-                      final content = AnimatedSwitcher(
-                        duration: Ui.motion(context, Ui.base),
-                        switchInCurve: Ui.easeOut,
-                        switchOutCurve: Ui.easeIn,
-                        child: _buildActiveView(
-                          ctrl: ctrl,
-                          hasVideo: hasVideo,
-                          useFlexibleStage: !isCompact,
-                        ),
-                      );
-
-                      final padded = Padding(
-                        padding: EdgeInsets.fromLTRB(
-                          horizontalPad,
-                          Ui.s1,
-                          horizontalPad,
-                          Ui.s4,
-                        ),
-                        child: content,
-                      );
-
-                      if (isCompact) {
-                        return SingleChildScrollView(child: padded);
-                      }
-                      return padded;
-                    },
+                  Expanded(
+                    child: inEditor
+                        ? _buildEditorViewport(
+                            ctrl: ctrl,
+                            hasVideo: hasVideo,
+                            scaledPx: scaledPx,
+                          )
+                        : _buildShellTabs(scaledPx: scaledPx),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
@@ -1417,12 +1440,232 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
     );
   }
 
-  Widget _buildActiveView({
+  Widget _buildTopHeader({
+    required bool inEditor,
+    required bool hasVideo,
+    required double scaledPx,
+  }) {
+    if (inEditor) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(Ui.s2, Ui.s1, Ui.s4, Ui.s1),
+        child: SizedBox(
+          height: 44,
+          child: Row(
+            children: <Widget>[
+              IconAction(
+                key: const Key('editor_back_button'),
+                icon: LucideIcons.chevronLeft,
+                semanticLabel: '返回',
+                enabled: !_isConverting && !_isLoadingVideo,
+                onTap: () => unawaited(_closeEditor()),
+              ),
+              const SizedBox(width: 2),
+              const Flexible(
+                child: Text(
+                  AppBranding.appName,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Ui.wordmark,
+                ),
+              ),
+              const Spacer(),
+              if (hasVideo) ...<Widget>[
+                IconAction(
+                  key: const Key('export_tools_button'),
+                  icon: LucideIcons.share,
+                  filled: true,
+                  size: 17,
+                  semanticLabel: '导出纯视频或高清封面',
+                  enabled: !_isConverting,
+                  onTap: _openExportToolsSheet,
+                ),
+                const SizedBox(width: 4),
+                if (scaledPx > 15.5)
+                  IconAction(
+                    key: const Key('replace_video_button'),
+                    icon: LucideIcons.arrowLeftRight,
+                    filled: true,
+                    size: 17,
+                    semanticLabel: '更换视频素材',
+                    enabled: !_isConverting,
+                    onTap: _openSourceSheet,
+                  )
+                else
+                  PillAction(
+                    key: const Key('replace_video_button'),
+                    label: '更换',
+                    semanticLabel: '更换视频素材',
+                    icon: LucideIcons.arrowLeftRight,
+                    enabled: !_isConverting,
+                    onTap: _openSourceSheet,
+                  ),
+              ],
+            ],
+          ),
+        ),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(Ui.s5, Ui.s1, Ui.s5, Ui.s1),
+      child: SizedBox(
+        height: 44,
+        child: switch (_activeTab) {
+          StudioTab.home => Row(
+              children: <Widget>[
+                const Flexible(
+                  child: Text(
+                    AppBranding.appName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Ui.wordmark,
+                  ),
+                ),
+                if (scaledPx <= 16.0) ...<Widget>[
+                  const SizedBox(width: Ui.s2),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 7,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Ui.surface,
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: Ui.hairline),
+                    ),
+                    child: Text(
+                      'LIVE',
+                      style: Ui.mono.copyWith(
+                        fontSize: 10.5,
+                        letterSpacing: 0.6,
+                        color: Ui.textSecondary,
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          StudioTab.tools => const Align(
+              alignment: Alignment.centerLeft,
+              child: Text('工具', style: Ui.wordmark),
+            ),
+          StudioTab.settings => Row(
+              children: <Widget>[
+                const Text('设置', style: Ui.wordmark),
+                const Spacer(),
+                Text(
+                  AppBranding.versionLabel,
+                  style: Ui.mono.copyWith(
+                    fontSize: 12,
+                    color: Ui.textTertiary,
+                  ),
+                ),
+              ],
+            ),
+        },
+      ),
+    );
+  }
+
+  Widget _buildShellTabs({required double scaledPx}) {
+    return IndexedStack(
+      index: _activeTab.index,
+      children: <Widget>[
+        LayoutBuilder(
+          builder: (BuildContext context, BoxConstraints constraints) {
+            final horizontalPad = constraints.maxWidth >= 500 ? 24.0 : 18.0;
+            final isCompact = constraints.maxHeight < 480 || scaledPx > 16.5;
+
+            final homeChild = Padding(
+              padding: EdgeInsets.fromLTRB(
+                horizontalPad,
+                Ui.s1,
+                horizontalPad,
+                Ui.s4,
+              ),
+              child: EmptyStudioView(
+                platformTag: _platformTag,
+                isBusy: _isConverting,
+                onPickGallery: _pickFromGallery,
+                onPickFiles: _pickFromFiles,
+              ),
+            );
+
+            if (isCompact) {
+              return SingleChildScrollView(child: homeChild);
+            }
+            return homeChild;
+          },
+        ),
+        ToolsHistoryView(
+          isBusy: _isConverting,
+          historyEntries: _historyEntries,
+          onPickBatch: _pickBatchVideos,
+          onPickLiveUnpack: _pickAndUnpackLivePhoto,
+          onSelectHistory: (ConversionHistoryEntry entry) {
+            unawaited(_restoreFromHistoryEntry(entry));
+          },
+          onDeleteHistory: _deleteHistoryEntry,
+          onClearHistory: _clearAllHistory,
+        ),
+        SettingsView(
+          preferences: _preferences,
+          onPreferencesChanged: _updatePreferences,
+          historyCount: _historyEntries.length,
+          historyStorageBytes: _historyStorageBytes,
+          onClearHistory: _clearAllHistory,
+          platformFormatSummary: _platformFormatSummary,
+          enabled: !_isConverting,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildEditorViewport({
+    required VideoPlayerController? ctrl,
+    required bool hasVideo,
+    required double scaledPx,
+  }) {
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        final horizontalPad = constraints.maxWidth >= 500 ? 24.0 : 18.0;
+        final isCompact = constraints.maxHeight < 560 || scaledPx > 18.0;
+
+        final content = AnimatedSwitcher(
+          duration: Ui.motion(context, Ui.base),
+          switchInCurve: Ui.easeOut,
+          switchOutCurve: Ui.easeIn,
+          child: _buildEditorBody(
+            ctrl: ctrl,
+            hasVideo: hasVideo,
+            useFlexibleStage: !isCompact,
+          ),
+        );
+
+        final padded = Padding(
+          padding: EdgeInsets.fromLTRB(
+            horizontalPad,
+            Ui.s1,
+            horizontalPad,
+            Ui.s4,
+          ),
+          child: content,
+        );
+
+        if (isCompact) {
+          return SingleChildScrollView(child: padded);
+        }
+        return padded;
+      },
+    );
+  }
+
+  Widget _buildEditorBody({
     required VideoPlayerController? ctrl,
     required bool hasVideo,
     required bool useFlexibleStage,
   }) {
-    if (_isLoadingVideo) {
+    if (_isLoadingVideo || !hasVideo || ctrl == null) {
       return Center(
         key: const ValueKey<String>('state_loading'),
         child: Column(
@@ -1436,20 +1679,6 @@ class _ConverterHomePageState extends State<ConverterHomePage> {
             const SizedBox(height: Ui.s3),
             Text('正在读取视频...', style: Ui.body),
           ],
-        ),
-      );
-    }
-
-    if (!hasVideo || ctrl == null) {
-      return KeyedSubtree(
-        key: const ValueKey<String>('state_empty'),
-        child: EmptyStudioView(
-          platformTag: _platformTag,
-          isBusy: _isConverting,
-          onPickGallery: _pickFromGallery,
-          onPickFiles: _pickFromFiles,
-          onPickBatch: _pickBatchVideos,
-          onPickLiveUnpack: _pickAndUnpackLivePhoto,
         ),
       );
     }

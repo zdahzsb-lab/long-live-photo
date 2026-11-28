@@ -24,6 +24,7 @@ Future<void> showBatchQueueSheet({
   required PlaybackSpeedPreset initialSpeed,
   required bool initialKeepAudio,
   required bool initialPreserveMetadata,
+  BatchCoverStrategy initialCoverStrategy = BatchCoverStrategy.halfSecond,
   ValueChanged<List<ConversionHistoryEntry>>? onHistoryUpdated,
   Future<void> Function(String? savedTarget)? onOpenGallery,
 }) {
@@ -43,6 +44,7 @@ Future<void> showBatchQueueSheet({
         initialSpeed: initialSpeed,
         initialKeepAudio: initialKeepAudio,
         initialPreserveMetadata: initialPreserveMetadata,
+        initialCoverStrategy: initialCoverStrategy,
         onHistoryUpdated: onHistoryUpdated,
         onOpenGallery: onOpenGallery,
       );
@@ -59,6 +61,7 @@ class _BatchQueueSheetContent extends StatefulWidget {
     required this.initialSpeed,
     required this.initialKeepAudio,
     required this.initialPreserveMetadata,
+    this.initialCoverStrategy = BatchCoverStrategy.halfSecond,
     this.onHistoryUpdated,
     this.onOpenGallery,
   });
@@ -70,6 +73,7 @@ class _BatchQueueSheetContent extends StatefulWidget {
   final PlaybackSpeedPreset initialSpeed;
   final bool initialKeepAudio;
   final bool initialPreserveMetadata;
+  final BatchCoverStrategy initialCoverStrategy;
   final ValueChanged<List<ConversionHistoryEntry>>? onHistoryUpdated;
   final Future<void> Function(String? savedTarget)? onOpenGallery;
 
@@ -101,6 +105,7 @@ class _BatchQueueSheetContentState extends State<_BatchQueueSheetContent> {
     _speed = widget.initialSpeed;
     _keepAudio = widget.initialKeepAudio;
     _preserveMetadata = widget.initialPreserveMetadata;
+    _coverStrategy = widget.initialCoverStrategy;
   }
 
   @override
